@@ -1,0 +1,1 @@
+Get-Log -LogType Audit -Tail -Minutes 43200 | Export-Csv -Path .\auditLogs.csv -NoTypeInformation

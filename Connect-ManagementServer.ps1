@@ -1,0 +1,1 @@
+Connect-ManagementServer -AcceptEula -Server localhost

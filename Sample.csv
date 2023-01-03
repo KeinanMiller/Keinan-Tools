@@ -1,0 +1,5 @@
+Section,Method,Command,Arguments,Name,Description
+Server,powershell_file,NTP.ps1,,NTP,Auto Install NTP server and configure Firewall
+Server,powershell_file,https://github.com/KeinanMiller/WORKSCRIPTS/blob/main/Scripts/Health-Check-v1.2.ps1,,Server Heath Report,"Pull a report of CPU, RAM and Network card"
+Milestone,powershell_file,PS install.ps1,,Install Milestone PSTools,
+Milestone,powershell_file,Connect-ManagementServer.ps1,,Connect to Managment client,
