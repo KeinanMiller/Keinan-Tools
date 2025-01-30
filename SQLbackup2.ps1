@@ -1,3 +1,5 @@
+#used for automation of backup of SQL express updated from SQLbackup1 due to customer having issue with other scipts invoke command
+
 # Define backup folder path
 $backupFolder = "C:\installs\backups"
 
