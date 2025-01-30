@@ -1,3 +1,4 @@
+#Milestone script to remove cameras from groups if camera is disabled
 Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
 $root = Get-ConfigurationItem -Path /CameraGroupFolder
 $stack = New-Object System.Collections.Stack
