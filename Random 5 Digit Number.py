@@ -1,3 +1,4 @@
+#output a random 5 digit number for code genertation 
 import tkinter as tk
 import random
 
