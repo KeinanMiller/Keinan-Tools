@@ -1,3 +1,4 @@
+#used to pull hardware level report with password
 #Date and Date Structure
 $CurrentDate = Get-Date
 $CurrentDate = $CurrentDate.ToString('yyyy-MM-dd')
