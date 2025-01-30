@@ -1,3 +1,5 @@
+#used in the install of milestone powershelltools. see https://www.milestonepstools.com/getting-started/ for more info
+
 $script = @"
 Write-Host 'Setting SecurityProtocol to TLS 1.2, Execution Policy to RemoteSigned' -ForegroundColor Green
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
