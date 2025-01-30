@@ -1,3 +1,5 @@
+#Pull a camera report without retention info much faster to run.
+
 #Date and Date Structure
 $CurrentDate = Get-Date
 $CurrentDate = $CurrentDate.ToString('yyyy-MM-dd')
