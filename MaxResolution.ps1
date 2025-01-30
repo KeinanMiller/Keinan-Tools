@@ -1,3 +1,4 @@
+Connect-ManagementServer -ShowDialog -AcceptEula
 foreach ($rec in Get-RecordingServer) {
     foreach ($hw in $rec | Get-Hardware | Where-Object Enabled) {
         foreach ($cam in $hw | Get-Camera | Where-Object Enabled) {
@@ -13,4 +14,4 @@ foreach ($rec in Get-RecordingServer) {
         }
     }
 }
-
+Disconnect-ManagementServer

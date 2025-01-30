@@ -1,3 +1,4 @@
+Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
 $root = Get-ConfigurationItem -Path /CameraGroupFolder
 $stack = New-Object System.Collections.Stack
 $stack.Push($root)
@@ -18,3 +19,4 @@ while ($stack.Count -gt 0) {
         $task | Invoke-Method -MethodId $task.MethodIds[0]
     }
 }
+Disconnect-ManagementServer

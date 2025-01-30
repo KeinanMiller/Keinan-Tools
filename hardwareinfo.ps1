@@ -2,10 +2,10 @@
 $CurrentDate = Get-Date
 $CurrentDate = $CurrentDate.ToString('yyyy-MM-dd')
 #Create File Location 
-New-Item -path C:\Installs\HealthCheck\Milestone\$CurrentDate -type Directory -ErrorAction Ignore
+New-Item -path c:\Installs\HealthCheck\Milestone\$CurrentDate -type Directory -ErrorAction Ignore
 
 
-Connect-ManagementServer -AcceptEula -Server localhost
+Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
 $hardwareInfo = New-Object -TypeName System.Collections.ArrayList
 foreach ($rec in Get-RecordingServer)
 {

@@ -1,3 +1,4 @@
+Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
 function Set-AdaptiveStreaming {
     
     [CmdletBinding()]
@@ -128,3 +129,5 @@ function Set-AdaptiveStreaming {
         }
     }
 }
+Set-AdaptiveStreaming(3)
+Disconnect-ManagementServer

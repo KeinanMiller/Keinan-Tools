@@ -1,6 +1,6 @@
 $serverName = "localhost"
 $backupDirectory = "c:\installs\backupSQL"
-$daysToStoreBackups = 0
+$daysToStoreBackups = 7
 
 [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.SMO") | Out-Null
 [System.Reflection.Assembly]::LoadWithPartialName("Microsoft.SqlServer.SmoExtended") | Out-Null
