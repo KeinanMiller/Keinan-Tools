@@ -1,3 +1,4 @@
+#used to ping a range if IPs and output the resulted based off what is uncommented on last lines
 $ipAddressPrefix = "172.16.201."
 $startRange = 50
 $endRange = 70
