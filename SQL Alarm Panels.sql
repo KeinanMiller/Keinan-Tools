@@ -1,3 +1,4 @@
+--used to pull info on all alarm panel via sql query.
 USE ACCESSCONTROL
 SELECT
 	 ALARMPANEL.NAME as Panel_Name, 
