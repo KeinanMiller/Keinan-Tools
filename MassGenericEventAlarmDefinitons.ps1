@@ -1,4 +1,4 @@
-
+#Created Alarm events in milestone off of Generic events 
 Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
 $ms = Get-VmsManagementServer
 $events = $ms.UserDefinedEventFolder.UserDefinedEvents | Out-GridView -OutputMode Multiple -Title 'Select one or more Events'
@@ -19,8 +19,8 @@ foreach ($ge in $events) {
         ManagementTimeoutTime      = '00:01:00' # Time in HH:MM:SS before escalation event is triggered.
         ManagementTimeoutEventList = '' # Path of escalation event to trigger
         RelatedCameraList          = '' # Delimited list of Camera[id] paths of related cameras
-        MapType                    = '1' # 0=None, 1=Map, 2=Smart Map
-        RelatedMap                 = 'CEA7BCDA-59BA-4EEB-AE20-31198F3BCC54'
+        MapType                    = '0' # 0=None, 1=Map, 2=Smart Map
+        RelatedMap                 = ''
         Owner                      = ''
         Priority                   = '8188ff24-b5da-4c19-9ebf-c1d8fc2caa75' # High=8188ff24-b5da-4c19-9ebf-c1d8fc2caa75, Medium=9ad9338b-22ba-4f2e-bf62-e6948ae99bbf, Low=34f1f987-6854-44fb-88a5-daa0add1e38a
         Category                   = '00000000-0000-0000-0000-000000000000'
