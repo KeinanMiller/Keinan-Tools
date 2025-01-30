@@ -1,3 +1,4 @@
+#used to take a snap shot of cameras see commented code below to select type of export
 foreach ($site in Get-Site -ListAvailable) {
     $site | Select-Site
     foreach ($rec in Get-RecordingServer) {
