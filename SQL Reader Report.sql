@@ -1,3 +1,4 @@
+--used to pull reader report needs to add panel type in future update 
 USE ACCESSCONTROL
 SELECT 
 
