@@ -1,3 +1,5 @@
+--needs fixed with second join 
+
 SELECT
     ALARMINPUT.INPUTID AS Input_Address,
     ALARMINPUT.NAME AS Input_Name,
