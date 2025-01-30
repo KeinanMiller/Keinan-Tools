@@ -1,3 +1,4 @@
+#basic jiggler to prevent away or computer lock using volume buttons
 import pyautogui
 import time
 
