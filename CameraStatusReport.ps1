@@ -1,3 +1,5 @@
+#Basic camera report and places in a created folder listed below
+
 #Date and Date Structure
 $CurrentDate = Get-Date
 $CurrentDate = $CurrentDate.ToString('yyyy-MM-dd')
