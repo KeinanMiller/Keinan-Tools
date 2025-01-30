@@ -1,3 +1,6 @@
+#Looks through all recording servers and outputs any enabled cameras without records --needs updating for aliasing
+
+
 foreach ($rec in Get-RecordingServer) {
     foreach ($hardware in Get-Hardware -RecordingServer $rec) {
         if (-not $hardware.Enabled) { continue }
