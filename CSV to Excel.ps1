@@ -1,3 +1,5 @@
+# Used to take all CSVs in a folder and put to an Excel workbook. Excel is required to be installed on the machine
+
 $outputfilename = Read-Host -Prompt "Output files Name"
 $Path = Read-Host -Prompt "Please enter the file path:"
 
