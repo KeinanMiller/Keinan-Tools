@@ -1,1 +1,0 @@
-Get-Hardware | Where-Object Enabled | Get-VMSCamera | Where-Object Enabled | Select-Object Name, Description, Id  | Export-Csv -Path c:\installs\CameraNamesExport.csv -NoTypeInformation
