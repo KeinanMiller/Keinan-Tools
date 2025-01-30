@@ -1,3 +1,5 @@
+#used for setting IP of laptop to predetrimed IP
+
 # Set the IP address, subnet mask, and default gateway
 $IPAddress = "192.168.1.49"
 $SubnetMask = "255.255.255.0"
