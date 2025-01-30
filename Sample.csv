@@ -1,9 +1,0 @@
-Section,Method,Command,Arguments,Name,Description
-Milestone PSTOOLS Install,powershell_file,c:\users\keinanm\desktop\scripts\PS install.ps1,,Install Milestone PSTools,Install Milestone Powershell Tools on local machine for all users
-Milestone PSTOOLS Reports,powershell_file,DeviceReport.ps1,,Stream Report,Per Stream report CSV exported to c:\Installs\HealthCheck\Milestone\ 
-Milestone PSTOOLS Reports,powershell_file,DeviceRecordingReport.ps1,,Stream Report /w recording info ,Per Stream report CSV exported to c:\Installs\HealthCheck\Milestone\ this report can take a long to generate
-Milestone PSTOOLS Reports,powershell_file,hardwareinfo.ps1,,Hardware Report,Generates Hardware report C:\Installs\HealthCheck\Milestone\ this report does pull device passwords
-Milestone PSTOOLS Configuration ,powershell_file,Hanwha Stream Settings.ps1,,Hanwha Device optimizer,Allows Selection of cameras and sets Hanwha Devices to 15 fps and Streaming mode to RTP\RTSP\TCP
-Milestone PSTOOLS Configuration ,powershell_file,AXIS Stream Settings.ps1,,AXIS Device optimizer,"Allows Selection of cameras and sets AXIS Devices to 15 fps, Streaming mode to RTP\RTSP\TCP, and Zipstream to Medium"
-Milestone PSTOOLS Configuration ,powershell_file,Set-AdaptiveStreaming .ps1,,Adaptive Streaming,Set Adaptive Streaming on device with 3 streams
-Milestone PSTOOLS Configuration ,powershell_file,MaxResolution.ps1,,Max Resolution ,Set Max resolution on All Cameras
