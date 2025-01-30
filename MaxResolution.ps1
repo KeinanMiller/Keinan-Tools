@@ -1,3 +1,4 @@
+#used to set all cameras to max resolution no stream 1 -todo need alias update 
 Connect-ManagementServer -ShowDialog -AcceptEula
 foreach ($rec in Get-RecordingServer) {
     foreach ($hw in $rec | Get-Hardware | Where-Object Enabled) {
