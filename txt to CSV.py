@@ -1,3 +1,4 @@
+# used for special case of txt to cvs
 import csv
 from tkinter import Tk, filedialog
 
