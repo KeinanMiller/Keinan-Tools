@@ -1,4 +1,4 @@
-
+#Created Alarm events in milestone off of User defined events
 Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
 $ms = Get-VmsManagementServer
 $events = $ms.UserDefinedEventFolder.UserDefinedEvents | Out-GridView -OutputMode Multiple -Title 'Select one or more Events'
