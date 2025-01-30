@@ -1,4 +1,5 @@
-﻿$Style = "
+#Server Health report Generic report needs updating
+ $Style = "
 <style>
     BODY{background-color:#366d9f;}
     TABLE{border-width: 1px;border-style: solid;border-color: black;border-collapse: collapse;}
