@@ -1,3 +1,4 @@
+#used for automation of sql backup of SQL express
 $serverName = "localhost"
 $backupDirectory = "c:\installs\backupSQL"
 $daysToStoreBackups = 7
