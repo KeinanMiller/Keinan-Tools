@@ -1,3 +1,6 @@
+#pulls a report of all enabled cameras and includes all retention info takes longer that the other camera reports
+
+
 #Date and Date Structure
 $CurrentDate = Get-Date
 $CurrentDate = $CurrentDate.ToString('yyyy-MM-dd')
