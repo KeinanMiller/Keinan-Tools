@@ -1,4 +1,4 @@
-
+#this sets any camera AXIS camera selected to 15 frames per second, adjusts streaming mode and sets zip stream
 Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
 $camera = Select-Camera -Allowfolders -Allowservers -Title 'Select cameras'
 $stream = $camera | Get-VmsCameraStream -LiveDefault
