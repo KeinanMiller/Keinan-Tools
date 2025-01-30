@@ -1,1 +1,0 @@
-Show-ScriptMenuGui -csvPath 'C:\Installs\ToolBox\ToolBox\Scripts\_Controller.csv' -Verbose -HideConsole -windowtitle "Keinan's Tool Box"
