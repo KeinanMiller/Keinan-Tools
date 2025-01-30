@@ -1,3 +1,4 @@
+#export a list of roles and what users are assigned to those roles
 Connect-ManagementServer -AcceptEula -Server localhost
 $roles = @()
 foreach ($role in Get-Role) {
