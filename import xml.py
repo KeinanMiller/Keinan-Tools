@@ -1,4 +1,4 @@
-#XML to CSV converter
+#XML to CSV converter this is used to put Protec XML to something usable
 import xml.etree.ElementTree as ET
 import csv
 import tkinter as tk
