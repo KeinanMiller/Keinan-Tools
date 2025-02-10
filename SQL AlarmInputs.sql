@@ -1,4 +1,4 @@
---needs fixed with second join 
+
 
 SELECT
     ALARMINPUT.INPUTID AS Input_Address,
@@ -13,4 +13,4 @@ SELECT
     END AS Supervision
 
 FROM ALARMINPUT
-LEFT JOIN ALARMPANEL ON ALARMINPUT.PANELID = ALARMPANEL.PANELID; 
+
