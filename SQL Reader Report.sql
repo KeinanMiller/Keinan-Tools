@@ -3,15 +3,15 @@ USE ACCESSCONTROL
 SELECT 
 
 	READERDESC as ReaderName, 
-    COMMADDR as ReaderAddress, 
+    	COMMADDR as ReaderAddress, 
 	READER_NUMBER as ReaderNumber,
 
-	CASE PORTNUM
-		WHEN 0 THEN 'Onboard Reader'
+CASE PORTNUM
+	WHEN 0 THEN 'Onboard Reader'
         WHEN 11 THEN 'Reader 1'
         WHEN 78 THEN 'IP addressed'
-		ELSE CAST(PORTNUM AS VARCHAR(10))
-	END AS Port_Number,
+	ELSE CAST(PORTNUM AS VARCHAR(10))
+END AS Port_Number,
 	
     CASE CTRLTYPE 
         WHEN 112 THEN 'LNL-1300'
@@ -24,7 +24,7 @@ SELECT
 
 	
     CASE DOORCONTACT_SUPERVISION 
-		WHEN 0 THEN 'Not Supervised Normally Closed'
+	WHEN 0 THEN 'Not Supervised Normally Closed'
         WHEN 1 THEN 'Not Supervised Normally Open'
         WHEN 2 THEN 'Default Supervision Normally Closed'
         WHEN 3 THEN 'Default Supervision Normally Open'
