@@ -19,7 +19,7 @@ SELECT
         WHEN 118 THEN 'LNL-1320'
         WHEN 159 THEN 'Onboard Reader'
 	WHEN 36 THEN 'Onboard Reader'
-        ELSE 'Default Setting or Non-Standard' 
+        ELSE 'Other' 
     END AS Controller_Type,
 
 	
