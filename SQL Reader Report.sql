@@ -12,7 +12,17 @@ SELECT
         WHEN 78 THEN 'IP addressed'
 		ELSE CAST(PORTNUM AS VARCHAR(10))
 	END AS Port_Number,
+	
+    CASE CTRLTYPE 
+        WHEN 112 THEN 'LNL-1300'
+        WHEN 115 THEN 'LNL-1320'
+        WHEN 118 THEN 'LNL-1320'
+        WHEN 159 THEN 'Onboard Reader'
+	WHEN 36 THEN 'Onboard Reader'
+        ELSE 'Default Setting or Non-Standard' 
+    END AS Controller_Type,
 
+	
     CASE DOORCONTACT_SUPERVISION 
 		WHEN 0 THEN 'Not Supervised Normally Closed'
         WHEN 1 THEN 'Not Supervised Normally Open'
