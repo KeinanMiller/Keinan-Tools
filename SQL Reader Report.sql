@@ -21,7 +21,7 @@ END AS Port_Number,
 	WHEN 21 THEN 'LNL-1300 OSDP'
         WHEN 159 THEN 'Onboard Reader'
 	WHEN 36 THEN 'Onboard Reader'
-        ELSE 'Other' 
+        ELSE CAST(CTRLTYPE AS VARCHAR(10))
     END AS Controller_Type,
 
 	
