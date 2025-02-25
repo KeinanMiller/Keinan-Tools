@@ -1,4 +1,4 @@
---used to pull reader report needs to add panel type in future update 
+--used to pull reader report 
 USE ACCESSCONTROL
 SELECT 
 
