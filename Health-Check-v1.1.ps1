@@ -10,7 +10,7 @@ $Style = "
 </style>
 "
 # Path = C:\psscripts
-$ReportHead = ConvertTo-HTML -AS Table -Fragment -PreContent '<H1>Reece System Health Check</H1>' |Out-String 
+$ReportHead = ConvertTo-HTML -AS Table -Fragment -PreContent '<H1>System Health Check</H1>' |Out-String 
 $OSHead = ConvertTo-HTML -AS Table -Fragment -PreContent '<H2>System Information</H2>'|Out-String  
 $DiskHead = ConvertTo-HTML -AS Table -Fragment -PreContent '<H2>Disk Information</H2>'|Out-String 
 $CPUusageHead = ConvertTo-HTML -AS Table -Fragment -PreContent '<H2>Percent CPU Average Usage Info</H2>'|Out-String
