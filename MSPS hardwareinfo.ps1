@@ -3,7 +3,7 @@
 $CurrentDate = Get-Date
 $CurrentDate = $CurrentDate.ToString('yyyy-MM-dd')
 #Create File Location 
-New-Item -path c:\Installs\HealthCheck\Milestone\$CurrentDate -type Directory -ErrorAction Ignore
+New-Item -path c:\Media\HealthCheck\Milestone\$CurrentDate -type Directory -ErrorAction Ignore
 
 
 Connect-ManagementServer -ShowDialog -Force -AcceptEula -ErrorAction Stop
@@ -30,5 +30,6 @@ foreach ($rec in Get-RecordingServer)
         $hardwareInfo.Add($row)
     }
 }
-$hardwareInfo | Export-Csv -Path c:\Installs\HealthCheck\Milestone\$CurrentDate\hardwareexport.csv -NoTypeInformation
+$hardwareInfo | Export-Csv -Path c:\Media\HealthCheck\Milestone\$CurrentDate\hardwareexport.csv -NoTypeInformation
 Disconnect-ManagementServer
+
