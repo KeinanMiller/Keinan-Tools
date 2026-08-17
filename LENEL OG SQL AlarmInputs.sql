@@ -1,4 +1,3 @@
-
 USE ACCESSCONTROL
 SELECT
     ALARMINPUT.INPUTID AS Input_Address,
@@ -11,6 +10,5 @@ SELECT
         WHEN 3 THEN 'Default Supervision Normally Open'
         ELSE 'Default setting or non-standard'
     END AS Supervision
-
 FROM ALARMINPUT
-
+JOIN ALARMPANEL ON ALARMINPUT.PANELID = ALARMPANEL.PANELID
