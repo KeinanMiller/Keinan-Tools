@@ -140,6 +140,96 @@ function Invoke-PingBatch {
     return $result
 }
 
+# The MAC of whatever is actually answering that IP. Only works when the
+# laptop is on the same subnet as the camera - ARP does not cross a router -
+# so an empty result here means "could not tell", never "no device".
+#
+# Its real job is the hard comparison: if this MAC differs from the one
+# Milestone recorded for the hardware, the device on that IP is physically
+# not the one the VMS was set up for. Vendor identification is left to the
+# HTTP Server/realm headers, which name the model outright.
+function Get-MacAddress {
+    param([string]$IPAddress)
+
+    if ([string]::IsNullOrWhiteSpace($IPAddress)) { return '' }
+
+    try {
+        if (Get-Command Get-NetNeighbor -ErrorAction SilentlyContinue) {
+            $n = @(Get-NetNeighbor -IPAddress $IPAddress -ErrorAction SilentlyContinue |
+                   Where-Object { $_.LinkLayerAddress -and $_.LinkLayerAddress -notmatch '^(00-00-00-00-00-00|)$' })
+            if ($n.Count -gt 0) {
+                return ([string]$n[0].LinkLayerAddress).ToUpperInvariant().Replace(':', '-')
+            }
+        }
+    } catch { }
+
+    # Fall back to the arp table for older Windows
+    try {
+        $lines = @(& arp -a $IPAddress 2>$null)
+        foreach ($line in $lines) {
+            if ($line -notmatch [regex]::Escape($IPAddress)) { continue }
+            if ($line -match '([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}') {
+                return $matches[0].ToUpperInvariant().Replace(':', '-')
+            }
+        }
+    } catch { }
+
+    return ''
+}
+
+# MilestonePSTools exposes richer per-device detail under different names in
+# different versions, so find the best one installed here rather than assuming.
+function Find-DetailCommand {
+    foreach ($name in 'Get-VmsCameraReport', 'Get-VmsDeviceStatus', 'Get-VmsCameraStatus', 'Get-VmsHardwareStatus') {
+        $cmd = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd }
+    }
+    return $null
+}
+
+# Ask that command about one camera. Only used when it can be aimed at a single
+# camera - a bulk report over a whole site is far too slow for the main pass.
+function Get-VmsDetailFor {
+    param($Command, $Camera, [switch]$AllowBulk)
+
+    if (-not $Command -or -not $Camera) { return $null }
+    try {
+        if ($Command.Parameters.ContainsKey('Camera')) {
+            return (& $Command -Camera $Camera -ErrorAction Stop)
+        }
+        if ($AllowBulk) {
+            $name = [string]$Camera.Name
+            return (& $Command -ErrorAction Stop | Where-Object { [string]$_.Name -eq $name })
+        }
+    } catch { }
+    return $null
+}
+
+# Pull the fields worth reading out of whatever shape that command returned.
+function Get-DetailFields {
+    param($Detail, [switch]$FaultsOnly)
+
+    $pairs = @()
+    if (-not $Detail) { return $pairs }
+    $obj = @($Detail)[0]
+    if (-not $obj) { return $pairs }
+
+    $wanted = 'error|status|state|reason|message|firmware|model|mac|driver|licen'
+    if ($FaultsOnly) { $wanted = 'error|reason|message|licen' }
+
+    foreach ($prop in $obj.PSObject.Properties) {
+        if ($prop.Name -notmatch $wanted) { continue }
+        $v = $prop.Value
+        if ($null -eq $v) { continue }
+        $s = ([string]$v).Trim()
+        if ([string]::IsNullOrWhiteSpace($s)) { continue }
+        # a boolean "no error" is noise, not information
+        if ($FaultsOnly -and $s -eq 'False') { continue }
+        $pairs += ('{0}={1}' -f $prop.Name, $s)
+    }
+    return $pairs
+}
+
 # Ask the device itself who it is. An unauthenticated GET of the device root -
 # the same request a browser makes - tells us a lot without sending any
 # credentials anywhere:
@@ -213,7 +303,9 @@ function Get-HttpIdentity {
 function Get-DeviceFingerprint {
     param([string]$ComputerName, [int]$Port, [string]$Scheme, [int]$PortTimeout = 2000)
 
-    $out = [pscustomobject]@{ Summary = ''; Ports = ''; Rtsp = $null }
+    $out = [pscustomobject]@{ Summary = ''; Ports = ''; Rtsp = $null; Mac = '' }
+
+    $out.Mac = Get-MacAddress -IPAddress $ComputerName
 
     $ports = @()
     if ($Port) { $ports += [int]$Port }
@@ -334,7 +426,7 @@ function Set-RowStatus {
 # sit behind it - encoders and multi-lens cameras all share one IP - and every
 # camera on that address gets the same answer.
 function Invoke-RowTests {
-    param($Rows, [int]$Count, [int]$PingTimeout, [int]$PortTimeout)
+    param($Rows, [int]$Count, [int]$PingTimeout, [int]$PortTimeout, $DetailCommand)
 
     $Rows = @($Rows)
     if ($Rows.Count -eq 0) { return }
@@ -351,6 +443,14 @@ function Invoke-RowTests {
     if ($targets.Count -gt 0) {
         Write-Host ("  {0} camera(s) to test on {1} address(es) - pinging ..." -f $Rows.Count, $targets.Count)
         $pingResults = Invoke-PingBatch -Target $targets -Count $Count -TimeoutMs $PingTimeout
+    }
+
+    # Per-camera VMS lookups are one round trip each. Fine for a handful of
+    # faults, not for a site that has fallen over - E still works one at a time.
+    $wantDetail = ($null -ne $DetailCommand)
+    if ($wantDetail -and $Rows.Count -gt 60) {
+        Write-Host ("  {0} cameras to check - skipping per-camera VMS detail this pass (press E for any one camera)." -f $Rows.Count) -ForegroundColor DarkGray
+        $wantDetail = $false
     }
 
     $portCache = @{}
@@ -403,6 +503,15 @@ function Invoke-RowTests {
             }
             $row.DeviceReply = $deep.Summary
             $row.OpenPorts   = $deep.Ports
+            $row.LiveMac     = $deep.Mac
+        }
+
+        # What the VMS itself says is wrong with this device, if the installed
+        # MilestonePSTools can be aimed at a single camera.
+        if ($wantDetail -and $row.CamObj) {
+            $detail = Get-VmsDetailFor -Command $DetailCommand -Camera $row.CamObj
+            $faults = @(Get-DetailFields -Detail $detail -FaultsOnly)
+            if ($faults.Count -gt 0) { $row.VmsDetail = ($faults -join '; ') }
         }
 
         if (-not $row.StatusFound) {
@@ -468,6 +577,17 @@ function Invoke-RowTests {
             $row.Result      = 'OFFLINE'
             $row.WhatToCheck = 'No ping and no port response. Camera is off, the cable / PoE port is dead, or the IP has changed. Go check it physically.'
         }
+
+        # A MAC that disagrees with the one Milestone recorded is not a hint,
+        # it is proof the device on that IP was replaced. Say it first.
+        if ($row.LiveMac -and $row.VmsMac -and ($row.LiveMac -ne $row.VmsMac)) {
+            $row.WhatToCheck = ('SWAPPED DEVICE: the kit answering {0} has MAC {1}, but Milestone recorded {2} for this hardware - it is physically not the same device. ' -f $row.PingTarget, $row.LiveMac, $row.VmsMac) + $row.WhatToCheck
+        }
+
+        # Whatever the VMS itself says is wrong beats anything we inferred
+        if ($row.VmsDetail) {
+            $row.WhatToCheck = $row.WhatToCheck + ' VMS reports: ' + $row.VmsDetail + '.'
+        }
     }
 }
 
@@ -514,6 +634,12 @@ function Show-Results {
                     Write-Host ("          milestone expects: {0}" -f $r.VmsModel) -ForegroundColor DarkGray
                 }
             }
+            if ($r.LiveMac -and $r.VmsMac -and ($r.LiveMac -ne $r.VmsMac)) {
+                Write-Host ("          SWAPPED: MAC {0} on the wire, {1} in Milestone" -f $r.LiveMac, $r.VmsMac) -ForegroundColor Red
+            }
+            if ($r.VmsDetail) {
+                Write-Host ("          vms says: {0}" -f $r.VmsDetail) -ForegroundColor DarkGray
+            }
         }
         Write-Host ''
     }
@@ -522,7 +648,7 @@ function Show-Results {
 # Everything the tool knows about one camera, plus the raw status feed entry.
 # This is the answer to "it works fine in Milestone, why is it on the list?".
 function Show-CameraDetail {
-    param($Rows, [string]$Name, [string]$Folder)
+    param($Rows, [string]$Name, [string]$Folder, $DetailCommand)
 
     if ([string]::IsNullOrWhiteSpace($Name)) { return }
 
@@ -619,6 +745,27 @@ function Show-CameraDetail {
         $null = $out.Add('   WHAT THE DEVICE ITSELF SAID')
         $null = $out.Add(("     reply           : {0}" -f $row.DeviceReply))
         $null = $out.Add(("     milestone expects: {0}" -f $row.VmsModel))
+        $null = $out.Add(("     MAC on the wire : {0}" -f $row.LiveMac))
+        $null = $out.Add(("     MAC in Milestone: {0}" -f $row.VmsMac))
+        if ($row.LiveMac -and $row.VmsMac -and ($row.LiveMac -ne $row.VmsMac)) {
+            $null = $out.Add('                       ^ these disagree - the device was swapped')
+        } elseif (-not $row.LiveMac) {
+            $null = $out.Add('                       (no MAC seen - normal if this laptop is not on the')
+            $null = $out.Add('                        same subnet as the camera; ARP does not cross a router)')
+        }
+
+        # The richer VMS-side report. Allowed to be slow here - it was asked for.
+        if ($DetailCommand) {
+            $null = $out.Add('')
+            $null = $out.Add(("   WHAT {0} SAYS" -f $DetailCommand.Name.ToUpperInvariant()))
+            $detail = Get-VmsDetailFor -Command $DetailCommand -Camera $row.CamObj -AllowBulk
+            $fields = @(Get-DetailFields -Detail $detail)
+            if ($fields.Count -eq 0) {
+                $null = $out.Add('     nothing returned for this camera')
+            } else {
+                foreach ($f in $fields) { $null = $out.Add('     ' + $f) }
+            }
+        }
         $null = $out.Add(("     last checked    : {0}" -f $row.LastChecked))
     }
 
@@ -651,7 +798,7 @@ function Save-Report {
         Sort-Object @{ Expression = { if ($_.Result -eq 'OK') { 1 } else { 0 } } }, Result, RecordingServer, Camera |
         Select-Object Camera, CameraIP, RecordingServer, Hardware, HardwareAddress,
                       VmsStatus, Ping, LatencyMs, Port, PortCheck, OpenPorts,
-                      VmsModel, DeviceReply,
+                      VmsModel, DeviceReply, VmsMac, LiveMac, VmsDetail,
                       FirstResult, Result, Fixed, WhatToCheck, LastChecked
 
     try {
@@ -813,9 +960,19 @@ try {
 
         $hwName = '(unknown)'
         $hwModel = ''
+        $hwMac   = ''
         if ($hw) {
             $hwName = [string]$hw.Name
             try { $hwModel = [string]$hw.Model } catch { }
+            foreach ($macProp in 'MacAddress', 'MAC', 'HardwareId') {
+                if ($hwMac) { break }
+                try {
+                    $mv = [string]$hw.$macProp
+                    if ($mv -match '([0-9a-fA-F]{2}[-:]?){6}') {
+                        $hwMac = ($matches[0] -replace '[:.]', '-').ToUpperInvariant()
+                    }
+                } catch { }
+            }
         }
         $rsName = '(unknown)'
         $rsHost = $null
@@ -831,9 +988,13 @@ try {
             Hardware        = $hwName
             HardwareAddress = $address
             VmsModel        = $hwModel
+            VmsMac          = $hwMac
+            LiveMac         = ''
+            VmsDetail       = ''
             Scheme          = $endpoint.Scheme
             DeviceReply     = ''
             OpenPorts       = ''
+            CamObj          = $cam
             VmsStatus       = 'Unknown'
             StatusFound     = $false
             Ping            = 'not tested'
@@ -862,6 +1023,15 @@ try {
         $CsvPath  = Join-Path $scriptDir ("CameraCheck_{0}_{1}.csv" -f $safeName, (Get-Date -Format 'yyyy-MM-dd_HHmm'))
     }
 
+    $detailCmd = Find-DetailCommand
+    if ($detailCmd) {
+        if ($detailCmd.Parameters.ContainsKey('Camera')) {
+            Write-Host ("  Using {0} for per-camera detail." -f $detailCmd.Name) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("  {0} is installed but cannot be aimed at one camera - it is used only in the E view." -f $detailCmd.Name) -ForegroundColor DarkGray
+        }
+    }
+
     $firstPass  = $true
     $recheckAll = $true      # the first pass always covers every camera
 
@@ -877,7 +1047,7 @@ try {
 
         Set-RowStatus -Rows $scope -StateMap $stateMap
         $toTest = @($scope | Where-Object { $_.Tested })
-        Invoke-RowTests -Rows $toTest -Count $PingCount -PingTimeout $PingTimeoutMs -PortTimeout $PortTimeoutMs
+        Invoke-RowTests -Rows $toTest -Count $PingCount -PingTimeout $PingTimeoutMs -PortTimeout $PortTimeoutMs -DetailCommand $detailCmd
 
         # Anything that was broken and is now responding got fixed on this visit
         foreach ($r in $scope) {
@@ -920,7 +1090,7 @@ try {
             elseif ($choice -match '^\s*[Aa]') { $action = 'all' }
             elseif ($choice -match '^\s*[Ee]') {
                 $who = Read-Host '   Camera name (part of it is enough)'
-                Show-CameraDetail -Rows $rows -Name $who -Folder $scriptDir
+                Show-CameraDetail -Rows $rows -Name $who -Folder $scriptDir -DetailCommand $detailCmd
                 Write-Host ''
             }
             else { $action = 'failing' }
