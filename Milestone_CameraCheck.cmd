@@ -71,14 +71,15 @@ function Get-IdKey {
 function Get-DeviceEndpoint {
     param([string]$Address)
 
-    $result = [pscustomobject]@{ Host = $null; Port = $null }
+    $result = [pscustomobject]@{ Host = $null; Port = $null; Scheme = 'http' }
     if ([string]::IsNullOrWhiteSpace($Address)) { return $result }
 
     try {
         $uri = [uri]$Address
         if ($uri.IsAbsoluteUri -and $uri.Host) {
-            $result.Host = $uri.Host
-            $result.Port = $uri.Port
+            $result.Host   = $uri.Host
+            $result.Port   = $uri.Port
+            $result.Scheme = $uri.Scheme
             return $result
         }
     } catch { }
@@ -139,6 +140,205 @@ function Invoke-PingBatch {
     return $result
 }
 
+# The MAC of whatever is actually answering that IP. Only works when the
+# laptop is on the same subnet as the camera - ARP does not cross a router -
+# so an empty result here means "could not tell", never "no device".
+#
+# Its real job is the hard comparison: if this MAC differs from the one
+# Milestone recorded for the hardware, the device on that IP is physically
+# not the one the VMS was set up for. Vendor identification is left to the
+# HTTP Server/realm headers, which name the model outright.
+function Get-MacAddress {
+    param([string]$IPAddress)
+
+    if ([string]::IsNullOrWhiteSpace($IPAddress)) { return '' }
+
+    try {
+        if (Get-Command Get-NetNeighbor -ErrorAction SilentlyContinue) {
+            $n = @(Get-NetNeighbor -IPAddress $IPAddress -ErrorAction SilentlyContinue |
+                   Where-Object { $_.LinkLayerAddress -and $_.LinkLayerAddress -notmatch '^(00-00-00-00-00-00|)$' })
+            if ($n.Count -gt 0) {
+                return ([string]$n[0].LinkLayerAddress).ToUpperInvariant().Replace(':', '-')
+            }
+        }
+    } catch { }
+
+    # Fall back to the arp table for older Windows
+    try {
+        $lines = @(& arp -a $IPAddress 2>$null)
+        foreach ($line in $lines) {
+            if ($line -notmatch [regex]::Escape($IPAddress)) { continue }
+            if ($line -match '([0-9a-fA-F]{2}[-:]){5}[0-9a-fA-F]{2}') {
+                return $matches[0].ToUpperInvariant().Replace(':', '-')
+            }
+        }
+    } catch { }
+
+    return ''
+}
+
+# MilestonePSTools exposes richer per-device detail under different names in
+# different versions, so find the best one installed here rather than assuming.
+function Find-DetailCommand {
+    foreach ($name in 'Get-VmsCameraReport', 'Get-VmsDeviceStatus', 'Get-VmsCameraStatus', 'Get-VmsHardwareStatus') {
+        $cmd = Get-Command -Name $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd }
+    }
+    return $null
+}
+
+# Ask that command about one camera. Only used when it can be aimed at a single
+# camera - a bulk report over a whole site is far too slow for the main pass.
+function Get-VmsDetailFor {
+    param($Command, $Camera, [switch]$AllowBulk)
+
+    if (-not $Command -or -not $Camera) { return $null }
+    try {
+        if ($Command.Parameters.ContainsKey('Camera')) {
+            return (& $Command -Camera $Camera -ErrorAction Stop)
+        }
+        if ($AllowBulk) {
+            $name = [string]$Camera.Name
+            return (& $Command -ErrorAction Stop | Where-Object { [string]$_.Name -eq $name })
+        }
+    } catch { }
+    return $null
+}
+
+# Pull the fields worth reading out of whatever shape that command returned.
+function Get-DetailFields {
+    param($Detail, [switch]$FaultsOnly)
+
+    $pairs = @()
+    if (-not $Detail) { return $pairs }
+    $obj = @($Detail)[0]
+    if (-not $obj) { return $pairs }
+
+    $wanted = 'error|status|state|reason|message|firmware|model|mac|driver|licen'
+    if ($FaultsOnly) { $wanted = 'error|reason|message|licen' }
+
+    foreach ($prop in $obj.PSObject.Properties) {
+        if ($prop.Name -notmatch $wanted) { continue }
+        $v = $prop.Value
+        if ($null -eq $v) { continue }
+        $s = ([string]$v).Trim()
+        if ([string]::IsNullOrWhiteSpace($s)) { continue }
+        # a boolean "no error" is noise, not information
+        if ($FaultsOnly -and $s -eq 'False') { continue }
+        $pairs += ('{0}={1}' -f $prop.Name, $s)
+    }
+    return $pairs
+}
+
+# Ask the device itself who it is. An unauthenticated GET of the device root -
+# the same request a browser makes - tells us a lot without sending any
+# credentials anywhere:
+#   HTTP 401 + WWW-Authenticate -> device is alive and wants a password, so the
+#                                  credential Milestone holds is the suspect
+#   HTTP 200                    -> web server answers with no auth at all
+#   Server: / realm=            -> often names the make and model, which is how
+#                                  you spot a camera that was swapped for a
+#                                  different one on the same IP
+function Get-HttpIdentity {
+    param([string]$ComputerName, [int]$Port, [switch]$UseTls, [int]$TimeoutMs = 3000)
+
+    $out = [pscustomobject]@{ Code = $null; Server = ''; Auth = ''; Realm = ''; Status = '' }
+    if (-not $ComputerName -or -not $Port) { return $out }
+
+    $scheme = 'http'
+    if ($UseTls) { $scheme = 'https' }
+    $url = '{0}://{1}:{2}/' -f $scheme, $ComputerName, $Port
+
+    $prevCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        # Cameras almost always carry a self-signed certificate. Accept it for
+        # this probe only, then put the previous policy straight back.
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol =
+                [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        } catch { }
+
+        $req = [System.Net.HttpWebRequest]([System.Net.WebRequest]::Create($url))
+        $req.Method            = 'GET'
+        $req.Timeout           = $TimeoutMs
+        $req.ReadWriteTimeout  = $TimeoutMs
+        $req.AllowAutoRedirect = $false
+        $req.UserAgent         = 'MilestoneCameraCheck'
+        $req.Credentials       = $null          # never send a password anywhere
+
+        $resp = $null
+        try {
+            $resp = $req.GetResponse()
+        } catch [System.Net.WebException] {
+            $resp = $_.Exception.Response       # a 401 lands here, and it is the useful case
+            if (-not $resp) {
+                $out.Status = [string]$_.Exception.Status
+                return $out
+            }
+        }
+
+        if ($resp) {
+            try { $out.Code   = [int]$resp.StatusCode } catch { }
+            try { $out.Server = [string]$resp.Headers['Server'] } catch { }
+            try {
+                $wa = [string]$resp.Headers['WWW-Authenticate']
+                if ($wa) {
+                    if ($wa -match '^\s*(\w+)')              { $out.Auth  = $matches[1] }
+                    if ($wa -match 'realm\s*=\s*"([^"]*)"')  { $out.Realm = $matches[1] }
+                }
+            } catch { }
+            try { $resp.Close() } catch { }
+        }
+    } catch {
+        $out.Status = 'error'
+    } finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCallback
+    }
+    return $out
+}
+
+# Which of the usual camera ports answer, plus the HTTP identity above.
+# Run once per address, never once per camera.
+function Get-DeviceFingerprint {
+    param([string]$ComputerName, [int]$Port, [string]$Scheme, [int]$PortTimeout = 2000)
+
+    $out = [pscustomobject]@{ Summary = ''; Ports = ''; Rtsp = $null; Mac = '' }
+
+    $out.Mac = Get-MacAddress -IPAddress $ComputerName
+
+    $ports = @()
+    if ($Port) { $ports += [int]$Port }
+    foreach ($p in 80, 443, 554) { if ($ports -notcontains $p) { $ports += $p } }
+
+    $states = @()
+    foreach ($p in $ports) {
+        $isOpen = Test-TcpPort -ComputerName $ComputerName -Port $p -TimeoutMs $PortTimeout
+        if ($p -eq 554) { $out.Rtsp = $isOpen }
+        if ($isOpen) { $states += ("{0} open"   -f $p) }
+        else         { $states += ("{0} closed" -f $p) }
+    }
+    $out.Ports = ($states -join ', ')
+
+    $useTls = ($Scheme -eq 'https' -or $Port -eq 443)
+    $id = Get-HttpIdentity -ComputerName $ComputerName -Port $Port -UseTls:$useTls -TimeoutMs $PortTimeout
+
+    $bits = @()
+    if ($id.Code) {
+        $bits += ('HTTP {0}' -f $id.Code)
+    } elseif ($id.Status) {
+        $bits += ('no HTTP reply ({0})' -f $id.Status)
+    } else {
+        $bits += 'no HTTP reply'
+    }
+    if ($id.Auth)   { $bits += ('auth ' + $id.Auth) }
+    if ($id.Server) { $bits += ('Server: ' + $id.Server) }
+    if ($id.Realm)  { $bits += ('realm: ' + $id.Realm) }
+    $out.Summary = ($bits -join ', ')
+
+    return $out
+}
+
 function Test-TcpPort {
     param([string]$ComputerName, [int]$Port, [int]$TimeoutMs = 2000)
     $client = New-Object System.Net.Sockets.TcpClient
@@ -179,6 +379,7 @@ function Get-VmsStateMap {
             $k = Get-IdKey $s.FQID.ObjectId
             if ($k) { $map[$k] = [string]$s.State }
         }
+        Write-Host ("  VMS returned a status for {0} item(s)." -f $map.Count) -ForegroundColor DarkGray
     } catch {
         Write-Host ("  Could not read live status: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
@@ -195,9 +396,14 @@ function Set-RowStatus {
         $row.Tested      = $false
         $row.LastChecked = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 
-        $state = 'Unknown'
-        if ($row.CameraKey -and $StateMap.ContainsKey($row.CameraKey)) { $state = $StateMap[$row.CameraKey] }
-        $row.VmsStatus = $state
+        # A camera missing from the status feed is NOT the same thing as a camera
+        # the VMS reports as broken. Keep them apart - otherwise a perfectly
+        # healthy camera gets condemned because we could not find its status.
+        $found = ($row.CameraKey -and $StateMap.ContainsKey($row.CameraKey))
+        $row.StatusFound = $found
+        if ($found) { $row.VmsStatus = $StateMap[$row.CameraKey] }
+        else        { $row.VmsStatus = 'no status returned' }
+        $state = $row.VmsStatus
 
         if ($state -eq 'Responding') {
             $row.Result      = 'OK'
@@ -220,7 +426,7 @@ function Set-RowStatus {
 # sit behind it - encoders and multi-lens cameras all share one IP - and every
 # camera on that address gets the same answer.
 function Invoke-RowTests {
-    param($Rows, [int]$Count, [int]$PingTimeout, [int]$PortTimeout)
+    param($Rows, [int]$Count, [int]$PingTimeout, [int]$PortTimeout, $DetailCommand)
 
     $Rows = @($Rows)
     if ($Rows.Count -eq 0) { return }
@@ -239,7 +445,16 @@ function Invoke-RowTests {
         $pingResults = Invoke-PingBatch -Target $targets -Count $Count -TimeoutMs $PingTimeout
     }
 
+    # Per-camera VMS lookups are one round trip each. Fine for a handful of
+    # faults, not for a site that has fallen over - E still works one at a time.
+    $wantDetail = ($null -ne $DetailCommand)
+    if ($wantDetail -and $Rows.Count -gt 60) {
+        Write-Host ("  {0} cameras to check - skipping per-camera VMS detail this pass (press E for any one camera)." -f $Rows.Count) -ForegroundColor DarkGray
+        $wantDetail = $false
+    }
+
     $portCache = @{}
+    $deepCache = @{}
     foreach ($row in $Rows) {
 
         if (-not $row.PingTarget) {
@@ -261,6 +476,8 @@ function Invoke-RowTests {
             $row.LatencyMs = $null
         }
 
+        $pinged = ($row.Ping -eq 'reply')
+
         $portOpen = $null
         if ($row.Port -and $row.VmsStatus -notmatch 'Server') {
             $cacheKey = '{0}|{1}' -f $row.PingTarget, $row.Port
@@ -276,9 +493,36 @@ function Invoke-RowTests {
             $row.PortCheck = 'not tested'
         }
 
-        $pinged = ($row.Ping -eq 'reply')
+        # Anything that answers the network gets interrogated, once per address
+        if ($pinged -and $row.VmsStatus -notmatch 'Server') {
+            if ($deepCache.ContainsKey($row.PingTarget)) {
+                $deep = $deepCache[$row.PingTarget]
+            } else {
+                $deep = Get-DeviceFingerprint -ComputerName $row.PingTarget -Port $row.Port -Scheme $row.Scheme -PortTimeout $PortTimeout
+                $deepCache[$row.PingTarget] = $deep
+            }
+            $row.DeviceReply = $deep.Summary
+            $row.OpenPorts   = $deep.Ports
+            $row.LiveMac     = $deep.Mac
+        }
 
-        if ($row.VmsStatus -match 'Server') {
+        # What the VMS itself says is wrong with this device, if the installed
+        # MilestonePSTools can be aimed at a single camera.
+        if ($wantDetail -and $row.CamObj) {
+            $detail = Get-VmsDetailFor -Command $DetailCommand -Camera $row.CamObj
+            $faults = @(Get-DetailFields -Detail $detail -FaultsOnly)
+            if ($faults.Count -gt 0) { $row.VmsDetail = ($faults -join '; ') }
+        }
+
+        if (-not $row.StatusFound) {
+            $row.Result = 'NO VMS STATUS'
+            if ($pinged) {
+                $row.WhatToCheck = 'The VMS returned no status at all for this camera, so this tool cannot say whether it works - it is NOT necessarily broken, and it answers ping. If it looks fine in Smart Client it probably is. Press E in the menu for the raw details.'
+            } else {
+                $row.WhatToCheck = 'The VMS returned no status for this camera and it does not answer ping. Check it in Smart Client, then press E in the menu for the raw details.'
+            }
+        }
+        elseif ($row.VmsStatus -match 'Server') {
             if ($pinged) {
                 $row.Result      = 'SERVER ISSUE'
                 $row.WhatToCheck = "Recording server '$($row.RecordingServer)' answers ping but the VMS says it is not responding. Check the Milestone Recording Server service on that host - the camera is probably fine."
@@ -292,8 +536,30 @@ function Invoke-RowTests {
             $row.WhatToCheck = "The name '$($row.PingTarget)' does not resolve. Fix DNS, or put the IP address in the hardware entry."
         }
         elseif ($pinged -and $portOpen -eq $true) {
-            $row.Result      = 'CONNECTION ISSUE'
-            $row.WhatToCheck = 'Camera is on the network and its web port is open, but the VMS cannot talk to it. Check the device password, firmware, port, stream settings, or licence.'
+            $row.Result = 'CONNECTION ISSUE'
+
+            if ($row.DeviceReply -match 'HTTP 401') {
+                $hint = 'The camera is alive and asking for a password (HTTP 401), so the network is fine and the device is fine. The password Milestone has stored for this hardware is the prime suspect - re-enter it on the hardware in Management Client.'
+            }
+            elseif ($row.DeviceReply -match 'HTTP 200') {
+                $hint = 'The camera web server answers with no password required (HTTP 200). Compare what it reports below with what Milestone expects - if they disagree, the device on this IP is not the one Milestone was set up for.'
+            }
+            elseif ($row.DeviceReply -match 'HTTP 30') {
+                $hint = 'The camera redirects the web request, which usually means it has moved to HTTPS. Check the protocol and port on the hardware in Management Client.'
+            }
+            elseif ($row.DeviceReply -match 'no HTTP reply') {
+                $hint = 'The port is open but nothing answers HTTP on it. Either the device moved to HTTPS, or something other than the camera now owns this IP address.'
+            }
+            else {
+                $hint = 'The camera is on the network and its port is open, but the VMS cannot talk to it. Check the device password, firmware, port, stream settings, or licence.'
+            }
+
+            if ($row.DeviceReply) { $hint = $hint + ' Device says: ' + $row.DeviceReply + '.' }
+            if ($row.VmsModel)    { $hint = $hint + ' Milestone expects: ' + $row.VmsModel + '.' }
+            if ($row.OpenPorts -match '554 closed') {
+                $hint = $hint + ' RTSP (554) is closed, so video cannot stream even though the web port answers.'
+            }
+            $row.WhatToCheck = $hint
         }
         elseif ($pinged -and $portOpen -eq $false) {
             $row.Result      = 'SERVICE DOWN'
@@ -310,6 +576,17 @@ function Invoke-RowTests {
         else {
             $row.Result      = 'OFFLINE'
             $row.WhatToCheck = 'No ping and no port response. Camera is off, the cable / PoE port is dead, or the IP has changed. Go check it physically.'
+        }
+
+        # A MAC that disagrees with the one Milestone recorded is not a hint,
+        # it is proof the device on that IP was replaced. Say it first.
+        if ($row.LiveMac -and $row.VmsMac -and ($row.LiveMac -ne $row.VmsMac)) {
+            $row.WhatToCheck = ('SWAPPED DEVICE: the kit answering {0} has MAC {1}, but Milestone recorded {2} for this hardware - it is physically not the same device. ' -f $row.PingTarget, $row.LiveMac, $row.VmsMac) + $row.WhatToCheck
+        }
+
+        # Whatever the VMS itself says is wrong beats anything we inferred
+        if ($row.VmsDetail) {
+            $row.WhatToCheck = $row.WhatToCheck + ' VMS reports: ' + $row.VmsDetail + '.'
         }
     }
 }
@@ -347,11 +624,168 @@ function Show-Results {
     foreach ($g in ($issues | Group-Object Result | Sort-Object Name)) {
         $color = 'Yellow'
         if ($g.Name -match 'OFFLINE|BAD ADDRESS|NO ADDRESS') { $color = 'Red' }
+        if ($g.Name -eq 'NO VMS STATUS') { $color = 'Cyan' }
         Write-Host ("   {0}  ({1})" -f $g.Name, $g.Count) -ForegroundColor $color
         foreach ($r in $g.Group) {
             Write-Host ("      {0,-38} {1,-16} ping: {2}" -f $r.Camera, $r.CameraIP, $r.Ping)
+            if ($r.DeviceReply) {
+                Write-Host ("          device: {0}" -f $r.DeviceReply) -ForegroundColor DarkGray
+                if ($r.VmsModel) {
+                    Write-Host ("          milestone expects: {0}" -f $r.VmsModel) -ForegroundColor DarkGray
+                }
+            }
+            if ($r.LiveMac -and $r.VmsMac -and ($r.LiveMac -ne $r.VmsMac)) {
+                Write-Host ("          SWAPPED: MAC {0} on the wire, {1} in Milestone" -f $r.LiveMac, $r.VmsMac) -ForegroundColor Red
+            }
+            if ($r.VmsDetail) {
+                Write-Host ("          vms says: {0}" -f $r.VmsDetail) -ForegroundColor DarkGray
+            }
         }
         Write-Host ''
+    }
+}
+
+# Everything the tool knows about one camera, plus the raw status feed entry.
+# This is the answer to "it works fine in Milestone, why is it on the list?".
+function Show-CameraDetail {
+    param($Rows, [string]$Name, [string]$Folder, $DetailCommand)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return }
+
+    $hits = @($Rows | Where-Object { $_.Camera -like "*$Name*" })
+    if ($hits.Count -eq 0) {
+        Write-Host '   No camera name contains that text.' -ForegroundColor Yellow
+        return
+    }
+    if ($hits.Count -gt 5) {
+        Write-Host ("   {0} cameras match '{1}'. Type more of the name." -f $hits.Count, $Name) -ForegroundColor Yellow
+        return
+    }
+
+    # Re-read the status feed, raw this time, so we can show the actual entry
+    $feed = @()
+    try {
+        $getState  = Get-Command Get-ItemState
+        $stateArgs = @{}
+        if ($getState.Parameters.ContainsKey('CamerasOnly')) { $stateArgs['CamerasOnly'] = $true }
+        $feed = @(Get-ItemState @stateArgs)
+    } catch {
+        Write-Host ("   Could not re-read the status feed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+
+    # What else is installed here that could dig deeper than Get-ItemState
+    $deeper = @()
+    try {
+        $deeper = @(Get-Command -Module MilestonePSTools -Name '*status*', '*state*', '*report*', '*diagnos*' -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Name | Sort-Object -Unique)
+    } catch { }
+
+    $out = New-Object System.Collections.ArrayList
+    foreach ($row in $hits) {
+
+        $entry = $null
+        foreach ($s in $feed) {
+            if ((Get-IdKey $s.FQID.ObjectId) -eq $row.CameraKey) { $entry = $s; break }
+        }
+
+        $foundText = 'yes'
+        if (-not $row.StatusFound) { $foundText = 'NO  <-- this is why it is on the list' }
+
+        $latency = ''
+        if ($null -ne $row.LatencyMs) { $latency = " ($($row.LatencyMs) ms)" }
+
+        $null = $out.Add('')
+        $null = $out.Add('  ============================================================')
+        $null = $out.Add(("   {0}" -f $row.Camera))
+        $null = $out.Add('  ============================================================')
+        $null = $out.Add(("   Verdict          : {0}" -f $row.Result))
+        $null = $out.Add(("   Reason given     : {0}" -f $row.WhatToCheck))
+        $null = $out.Add('')
+        $null = $out.Add('   WHAT THE VMS SAID')
+        $null = $out.Add(("     status          : {0}" -f $row.VmsStatus))
+        $null = $out.Add(("     found in feed   : {0}" -f $foundText))
+        $null = $out.Add(("     items in feed   : {0}" -f $feed.Count))
+        $null = $out.Add(("     this camera id  : {0}" -f $row.CameraKey))
+
+        if ($entry) {
+            $null = $out.Add(("     feed entry      : State={0}  FQID={1}" -f $entry.State, $entry.FQID.ObjectId))
+        } else {
+            $null = $out.Add('     feed entry      : NONE')
+            $sample = @($feed | Select-Object -First 3 | ForEach-Object { [string]$_.FQID.ObjectId })
+            if ($sample.Count -gt 0) {
+                $null = $out.Add(("     sample feed ids : {0}" -f ($sample -join ', ')))
+                $null = $out.Add('                       (compare the shape with this camera id above -')
+                $null = $out.Add('                        if they look different, the lookup is at fault,')
+                $null = $out.Add('                        not the camera)')
+            }
+        }
+
+        if ($row.StatusFound -and $row.VmsStatus -ne 'Responding') {
+            $null = $out.Add('')
+            $null = $out.Add('     The VMS itself is reporting this camera as not responding. If you')
+            $null = $out.Add('     can see LIVE video for it right now (live, not playback), then the')
+            $null = $out.Add('     status feed and the recording server disagree - press R to re-check,')
+            $null = $out.Add('     and if it sticks, look at the device under Recording Server in')
+            $null = $out.Add('     Management Client.')
+        }
+
+        $null = $out.Add('')
+        $null = $out.Add('   CONFIGURATION')
+        $null = $out.Add(("     camera enabled  : {0}" -f $row.CameraEnabled))
+        $null = $out.Add(("     hardware        : {0}  (enabled {1})" -f $row.Hardware, $row.HardwareEnabled))
+        $null = $out.Add(("     hardware address: {0}" -f $row.HardwareAddress))
+        $null = $out.Add(("     recording server: {0}  ({1})" -f $row.RecordingServer, $row.RsHost))
+        $null = $out.Add('')
+        $null = $out.Add('   NETWORK TEST')
+        $null = $out.Add(("     address tested  : {0}" -f $row.PingTarget))
+        $null = $out.Add(("     ping            : {0}{1}" -f $row.Ping, $latency))
+        $null = $out.Add(("     port {0,-11}: {1}" -f $row.Port, $row.PortCheck))
+        $null = $out.Add(("     ports seen      : {0}" -f $row.OpenPorts))
+        $null = $out.Add('')
+        $null = $out.Add('   WHAT THE DEVICE ITSELF SAID')
+        $null = $out.Add(("     reply           : {0}" -f $row.DeviceReply))
+        $null = $out.Add(("     milestone expects: {0}" -f $row.VmsModel))
+        $null = $out.Add(("     MAC on the wire : {0}" -f $row.LiveMac))
+        $null = $out.Add(("     MAC in Milestone: {0}" -f $row.VmsMac))
+        if ($row.LiveMac -and $row.VmsMac -and ($row.LiveMac -ne $row.VmsMac)) {
+            $null = $out.Add('                       ^ these disagree - the device was swapped')
+        } elseif (-not $row.LiveMac) {
+            $null = $out.Add('                       (no MAC seen - normal if this laptop is not on the')
+            $null = $out.Add('                        same subnet as the camera; ARP does not cross a router)')
+        }
+
+        # The richer VMS-side report. Allowed to be slow here - it was asked for.
+        if ($DetailCommand) {
+            $null = $out.Add('')
+            $null = $out.Add(("   WHAT {0} SAYS" -f $DetailCommand.Name.ToUpperInvariant()))
+            $detail = Get-VmsDetailFor -Command $DetailCommand -Camera $row.CamObj -AllowBulk
+            $fields = @(Get-DetailFields -Detail $detail)
+            if ($fields.Count -eq 0) {
+                $null = $out.Add('     nothing returned for this camera')
+            } else {
+                foreach ($f in $fields) { $null = $out.Add('     ' + $f) }
+            }
+        }
+        $null = $out.Add(("     last checked    : {0}" -f $row.LastChecked))
+    }
+
+    if ($deeper.Count -gt 0) {
+        $null = $out.Add('')
+        $null = $out.Add('   COMMANDS ON THIS PC THAT CAN DIG DEEPER THAN Get-ItemState')
+        foreach ($d in $deeper) { $null = $out.Add("     $d") }
+    }
+    $null = $out.Add('')
+
+    $text = $out -join [Environment]::NewLine
+    Write-Host $text
+
+    if ($Folder) {
+        try {
+            $safe = ($Name -replace '[\\/:*?"<>|]', '_')
+            $file = Join-Path $Folder ("CameraCheck_detail_{0}_{1}.txt" -f $safe, (Get-Date -Format 'HHmmss'))
+            $text | Out-File -FilePath $file -Encoding UTF8
+            Write-Host ("   Saved to {0}" -f $file) -ForegroundColor Green
+        } catch { }
     }
 }
 
@@ -363,7 +797,8 @@ function Save-Report {
     $export = @($Rows) |
         Sort-Object @{ Expression = { if ($_.Result -eq 'OK') { 1 } else { 0 } } }, Result, RecordingServer, Camera |
         Select-Object Camera, CameraIP, RecordingServer, Hardware, HardwareAddress,
-                      VmsStatus, Ping, LatencyMs, Port, PortCheck,
+                      VmsStatus, Ping, LatencyMs, Port, PortCheck, OpenPorts,
+                      VmsModel, DeviceReply, VmsMac, LiveMac, VmsDetail,
                       FirstResult, Result, Fixed, WhatToCheck, LastChecked
 
     try {
@@ -524,7 +959,21 @@ try {
         if ($hw) { try { $hwEnabled = [bool]$hw.Enabled } catch { } }
 
         $hwName = '(unknown)'
-        if ($hw) { $hwName = [string]$hw.Name }
+        $hwModel = ''
+        $hwMac   = ''
+        if ($hw) {
+            $hwName = [string]$hw.Name
+            try { $hwModel = [string]$hw.Model } catch { }
+            foreach ($macProp in 'MacAddress', 'MAC', 'HardwareId') {
+                if ($hwMac) { break }
+                try {
+                    $mv = [string]$hw.$macProp
+                    if ($mv -match '([0-9a-fA-F]{2}[-:]?){6}') {
+                        $hwMac = ($matches[0] -replace '[:.]', '-').ToUpperInvariant()
+                    }
+                } catch { }
+            }
+        }
         $rsName = '(unknown)'
         $rsHost = $null
         if ($rs) {
@@ -538,7 +987,16 @@ try {
             RecordingServer = $rsName
             Hardware        = $hwName
             HardwareAddress = $address
+            VmsModel        = $hwModel
+            VmsMac          = $hwMac
+            LiveMac         = ''
+            VmsDetail       = ''
+            Scheme          = $endpoint.Scheme
+            DeviceReply     = ''
+            OpenPorts       = ''
+            CamObj          = $cam
             VmsStatus       = 'Unknown'
+            StatusFound     = $false
             Ping            = 'not tested'
             LatencyMs       = $null
             Port            = $endpoint.Port
@@ -565,6 +1023,15 @@ try {
         $CsvPath  = Join-Path $scriptDir ("CameraCheck_{0}_{1}.csv" -f $safeName, (Get-Date -Format 'yyyy-MM-dd_HHmm'))
     }
 
+    $detailCmd = Find-DetailCommand
+    if ($detailCmd) {
+        if ($detailCmd.Parameters.ContainsKey('Camera')) {
+            Write-Host ("  Using {0} for per-camera detail." -f $detailCmd.Name) -ForegroundColor DarkGray
+        } else {
+            Write-Host ("  {0} is installed but cannot be aimed at one camera - it is used only in the E view." -f $detailCmd.Name) -ForegroundColor DarkGray
+        }
+    }
+
     $firstPass  = $true
     $recheckAll = $true      # the first pass always covers every camera
 
@@ -580,7 +1047,7 @@ try {
 
         Set-RowStatus -Rows $scope -StateMap $stateMap
         $toTest = @($scope | Where-Object { $_.Tested })
-        Invoke-RowTests -Rows $toTest -Count $PingCount -PingTimeout $PingTimeoutMs -PortTimeout $PortTimeoutMs
+        Invoke-RowTests -Rows $toTest -Count $PingCount -PingTimeout $PingTimeoutMs -PortTimeout $PortTimeoutMs -DetailCommand $detailCmd
 
         # Anything that was broken and is now responding got fixed on this visit
         foreach ($r in $scope) {
@@ -610,12 +1077,27 @@ try {
         Write-Host '   Go fix a camera, then re-check it here. Anything you have repaired'
         Write-Host '   turns green and drops off the list, and the CSV is rewritten.'
         Write-Host ''
-        Write-Host '     [R] Re-check only the cameras still failing   (just press Enter)'
-        Write-Host '     [A] Re-check every camera'
-        Write-Host '     [Q] Finish and open the report'
-        $choice = Read-Host '   Choice'
-        if ($choice -match '^\s*[Qq]') { break }
-        $recheckAll = ($choice -match '^\s*[Aa]')
+
+        $action = ''
+        while ($action -eq '') {
+            Write-Host '     [R] Re-check only the cameras still failing   (just press Enter)'
+            Write-Host '     [A] Re-check every camera'
+            Write-Host '     [E] Explain why one camera is on the list'
+            Write-Host '     [Q] Finish and open the report'
+            $choice = Read-Host '   Choice'
+
+            if     ($choice -match '^\s*[Qq]') { $action = 'quit' }
+            elseif ($choice -match '^\s*[Aa]') { $action = 'all' }
+            elseif ($choice -match '^\s*[Ee]') {
+                $who = Read-Host '   Camera name (part of it is enough)'
+                Show-CameraDetail -Rows $rows -Name $who -Folder $scriptDir -DetailCommand $detailCmd
+                Write-Host ''
+            }
+            else { $action = 'failing' }
+        }
+
+        if ($action -eq 'quit') { break }
+        $recheckAll = ($action -eq 'all')
         Write-Host ''
     }
 
