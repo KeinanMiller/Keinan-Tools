@@ -179,6 +179,7 @@ function Get-VmsStateMap {
             $k = Get-IdKey $s.FQID.ObjectId
             if ($k) { $map[$k] = [string]$s.State }
         }
+        Write-Host ("  VMS returned a status for {0} item(s)." -f $map.Count) -ForegroundColor DarkGray
     } catch {
         Write-Host ("  Could not read live status: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
     }
@@ -195,9 +196,14 @@ function Set-RowStatus {
         $row.Tested      = $false
         $row.LastChecked = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 
-        $state = 'Unknown'
-        if ($row.CameraKey -and $StateMap.ContainsKey($row.CameraKey)) { $state = $StateMap[$row.CameraKey] }
-        $row.VmsStatus = $state
+        # A camera missing from the status feed is NOT the same thing as a camera
+        # the VMS reports as broken. Keep them apart - otherwise a perfectly
+        # healthy camera gets condemned because we could not find its status.
+        $found = ($row.CameraKey -and $StateMap.ContainsKey($row.CameraKey))
+        $row.StatusFound = $found
+        if ($found) { $row.VmsStatus = $StateMap[$row.CameraKey] }
+        else        { $row.VmsStatus = 'no status returned' }
+        $state = $row.VmsStatus
 
         if ($state -eq 'Responding') {
             $row.Result      = 'OK'
@@ -278,7 +284,15 @@ function Invoke-RowTests {
 
         $pinged = ($row.Ping -eq 'reply')
 
-        if ($row.VmsStatus -match 'Server') {
+        if (-not $row.StatusFound) {
+            $row.Result = 'NO VMS STATUS'
+            if ($pinged) {
+                $row.WhatToCheck = 'The VMS returned no status at all for this camera, so this tool cannot say whether it works - it is NOT necessarily broken, and it answers ping. If it looks fine in Smart Client it probably is. Press E in the menu for the raw details.'
+            } else {
+                $row.WhatToCheck = 'The VMS returned no status for this camera and it does not answer ping. Check it in Smart Client, then press E in the menu for the raw details.'
+            }
+        }
+        elseif ($row.VmsStatus -match 'Server') {
             if ($pinged) {
                 $row.Result      = 'SERVER ISSUE'
                 $row.WhatToCheck = "Recording server '$($row.RecordingServer)' answers ping but the VMS says it is not responding. Check the Milestone Recording Server service on that host - the camera is probably fine."
@@ -347,11 +361,130 @@ function Show-Results {
     foreach ($g in ($issues | Group-Object Result | Sort-Object Name)) {
         $color = 'Yellow'
         if ($g.Name -match 'OFFLINE|BAD ADDRESS|NO ADDRESS') { $color = 'Red' }
+        if ($g.Name -eq 'NO VMS STATUS') { $color = 'Cyan' }
         Write-Host ("   {0}  ({1})" -f $g.Name, $g.Count) -ForegroundColor $color
         foreach ($r in $g.Group) {
             Write-Host ("      {0,-38} {1,-16} ping: {2}" -f $r.Camera, $r.CameraIP, $r.Ping)
         }
         Write-Host ''
+    }
+}
+
+# Everything the tool knows about one camera, plus the raw status feed entry.
+# This is the answer to "it works fine in Milestone, why is it on the list?".
+function Show-CameraDetail {
+    param($Rows, [string]$Name, [string]$Folder)
+
+    if ([string]::IsNullOrWhiteSpace($Name)) { return }
+
+    $hits = @($Rows | Where-Object { $_.Camera -like "*$Name*" })
+    if ($hits.Count -eq 0) {
+        Write-Host '   No camera name contains that text.' -ForegroundColor Yellow
+        return
+    }
+    if ($hits.Count -gt 5) {
+        Write-Host ("   {0} cameras match '{1}'. Type more of the name." -f $hits.Count, $Name) -ForegroundColor Yellow
+        return
+    }
+
+    # Re-read the status feed, raw this time, so we can show the actual entry
+    $feed = @()
+    try {
+        $getState  = Get-Command Get-ItemState
+        $stateArgs = @{}
+        if ($getState.Parameters.ContainsKey('CamerasOnly')) { $stateArgs['CamerasOnly'] = $true }
+        $feed = @(Get-ItemState @stateArgs)
+    } catch {
+        Write-Host ("   Could not re-read the status feed: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+
+    # What else is installed here that could dig deeper than Get-ItemState
+    $deeper = @()
+    try {
+        $deeper = @(Get-Command -Module MilestonePSTools -Name '*status*', '*state*', '*report*', '*diagnos*' -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Name | Sort-Object -Unique)
+    } catch { }
+
+    $out = New-Object System.Collections.ArrayList
+    foreach ($row in $hits) {
+
+        $entry = $null
+        foreach ($s in $feed) {
+            if ((Get-IdKey $s.FQID.ObjectId) -eq $row.CameraKey) { $entry = $s; break }
+        }
+
+        $foundText = 'yes'
+        if (-not $row.StatusFound) { $foundText = 'NO  <-- this is why it is on the list' }
+
+        $latency = ''
+        if ($null -ne $row.LatencyMs) { $latency = " ($($row.LatencyMs) ms)" }
+
+        $null = $out.Add('')
+        $null = $out.Add('  ============================================================')
+        $null = $out.Add(("   {0}" -f $row.Camera))
+        $null = $out.Add('  ============================================================')
+        $null = $out.Add(("   Verdict          : {0}" -f $row.Result))
+        $null = $out.Add(("   Reason given     : {0}" -f $row.WhatToCheck))
+        $null = $out.Add('')
+        $null = $out.Add('   WHAT THE VMS SAID')
+        $null = $out.Add(("     status          : {0}" -f $row.VmsStatus))
+        $null = $out.Add(("     found in feed   : {0}" -f $foundText))
+        $null = $out.Add(("     items in feed   : {0}" -f $feed.Count))
+        $null = $out.Add(("     this camera id  : {0}" -f $row.CameraKey))
+
+        if ($entry) {
+            $null = $out.Add(("     feed entry      : State={0}  FQID={1}" -f $entry.State, $entry.FQID.ObjectId))
+        } else {
+            $null = $out.Add('     feed entry      : NONE')
+            $sample = @($feed | Select-Object -First 3 | ForEach-Object { [string]$_.FQID.ObjectId })
+            if ($sample.Count -gt 0) {
+                $null = $out.Add(("     sample feed ids : {0}" -f ($sample -join ', ')))
+                $null = $out.Add('                       (compare the shape with this camera id above -')
+                $null = $out.Add('                        if they look different, the lookup is at fault,')
+                $null = $out.Add('                        not the camera)')
+            }
+        }
+
+        if ($row.StatusFound -and $row.VmsStatus -ne 'Responding') {
+            $null = $out.Add('')
+            $null = $out.Add('     The VMS itself is reporting this camera as not responding. If you')
+            $null = $out.Add('     can see LIVE video for it right now (live, not playback), then the')
+            $null = $out.Add('     status feed and the recording server disagree - press R to re-check,')
+            $null = $out.Add('     and if it sticks, look at the device under Recording Server in')
+            $null = $out.Add('     Management Client.')
+        }
+
+        $null = $out.Add('')
+        $null = $out.Add('   CONFIGURATION')
+        $null = $out.Add(("     camera enabled  : {0}" -f $row.CameraEnabled))
+        $null = $out.Add(("     hardware        : {0}  (enabled {1})" -f $row.Hardware, $row.HardwareEnabled))
+        $null = $out.Add(("     hardware address: {0}" -f $row.HardwareAddress))
+        $null = $out.Add(("     recording server: {0}  ({1})" -f $row.RecordingServer, $row.RsHost))
+        $null = $out.Add('')
+        $null = $out.Add('   NETWORK TEST')
+        $null = $out.Add(("     address tested  : {0}" -f $row.PingTarget))
+        $null = $out.Add(("     ping            : {0}{1}" -f $row.Ping, $latency))
+        $null = $out.Add(("     port {0,-11}: {1}" -f $row.Port, $row.PortCheck))
+        $null = $out.Add(("     last checked    : {0}" -f $row.LastChecked))
+    }
+
+    if ($deeper.Count -gt 0) {
+        $null = $out.Add('')
+        $null = $out.Add('   COMMANDS ON THIS PC THAT CAN DIG DEEPER THAN Get-ItemState')
+        foreach ($d in $deeper) { $null = $out.Add("     $d") }
+    }
+    $null = $out.Add('')
+
+    $text = $out -join [Environment]::NewLine
+    Write-Host $text
+
+    if ($Folder) {
+        try {
+            $safe = ($Name -replace '[\\/:*?"<>|]', '_')
+            $file = Join-Path $Folder ("CameraCheck_detail_{0}_{1}.txt" -f $safe, (Get-Date -Format 'HHmmss'))
+            $text | Out-File -FilePath $file -Encoding UTF8
+            Write-Host ("   Saved to {0}" -f $file) -ForegroundColor Green
+        } catch { }
     }
 }
 
@@ -539,6 +672,7 @@ try {
             Hardware        = $hwName
             HardwareAddress = $address
             VmsStatus       = 'Unknown'
+            StatusFound     = $false
             Ping            = 'not tested'
             LatencyMs       = $null
             Port            = $endpoint.Port
@@ -610,12 +744,27 @@ try {
         Write-Host '   Go fix a camera, then re-check it here. Anything you have repaired'
         Write-Host '   turns green and drops off the list, and the CSV is rewritten.'
         Write-Host ''
-        Write-Host '     [R] Re-check only the cameras still failing   (just press Enter)'
-        Write-Host '     [A] Re-check every camera'
-        Write-Host '     [Q] Finish and open the report'
-        $choice = Read-Host '   Choice'
-        if ($choice -match '^\s*[Qq]') { break }
-        $recheckAll = ($choice -match '^\s*[Aa]')
+
+        $action = ''
+        while ($action -eq '') {
+            Write-Host '     [R] Re-check only the cameras still failing   (just press Enter)'
+            Write-Host '     [A] Re-check every camera'
+            Write-Host '     [E] Explain why one camera is on the list'
+            Write-Host '     [Q] Finish and open the report'
+            $choice = Read-Host '   Choice'
+
+            if     ($choice -match '^\s*[Qq]') { $action = 'quit' }
+            elseif ($choice -match '^\s*[Aa]') { $action = 'all' }
+            elseif ($choice -match '^\s*[Ee]') {
+                $who = Read-Host '   Camera name (part of it is enough)'
+                Show-CameraDetail -Rows $rows -Name $who -Folder $scriptDir
+                Write-Host ''
+            }
+            else { $action = 'failing' }
+        }
+
+        if ($action -eq 'quit') { break }
+        $recheckAll = ($action -eq 'all')
         Write-Host ''
     }
 
