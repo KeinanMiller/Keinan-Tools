@@ -27,7 +27,11 @@ exit /b %errorlevel%
     HOW TO USE
         1. Double-click this file.
         2. Sign in when the Milestone login window appears.
-        3. Wait. A CSV report is written next to this file and opened for you.
+        3. Read the list of cameras with a problem.
+        4. Go fix one, then press R to re-check. Repaired cameras turn green
+           and drop off the list. The CSV next to this file is rewritten every
+           time, so it always matches what you have actually fixed.
+        5. Press Q when you are done - the report opens for you.
 
     HOW THIS FILE WORKS
         It is one file that is both a batch launcher and a PowerShell script.
@@ -163,6 +167,222 @@ function Stop-Here {
     exit 0
 }
 
+# --- Live status straight from the VMS ---------------------------------------
+
+function Get-VmsStateMap {
+    $map = @{}
+    try {
+        $getState  = Get-Command Get-ItemState
+        $stateArgs = @{}
+        if ($getState.Parameters.ContainsKey('CamerasOnly')) { $stateArgs['CamerasOnly'] = $true }
+        foreach ($s in @(Get-ItemState @stateArgs)) {
+            $k = Get-IdKey $s.FQID.ObjectId
+            if ($k) { $map[$k] = [string]$s.State }
+        }
+    } catch {
+        Write-Host ("  Could not read live status: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    }
+    return $map
+}
+
+# Apply the VMS status to a set of rows. Anything that needs a network test is
+# flagged Tested = $true and left to Invoke-RowTests.
+function Set-RowStatus {
+    param($Rows, $StateMap)
+
+    foreach ($row in @($Rows)) {
+        $row.PrevResult  = $row.Result
+        $row.Tested      = $false
+        $row.LastChecked = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+        $state = 'Unknown'
+        if ($row.CameraKey -and $StateMap.ContainsKey($row.CameraKey)) { $state = $StateMap[$row.CameraKey] }
+        $row.VmsStatus = $state
+
+        if ($state -eq 'Responding') {
+            $row.Result      = 'OK'
+            $row.WhatToCheck = 'Camera is responding. Nothing to do.'
+            $row.Ping        = 'not tested'
+            $row.LatencyMs   = $null
+            $row.PortCheck   = 'not tested'
+        }
+        elseif (-not $row.CameraEnabled -or -not $row.HardwareEnabled) {
+            $row.Result      = 'DISABLED'
+            $row.WhatToCheck = 'Camera or hardware is disabled in the VMS. Not tested.'
+        }
+        else {
+            $row.Tested = $true
+        }
+    }
+}
+
+# Ping and port test. Each address is tested ONCE no matter how many cameras
+# sit behind it - encoders and multi-lens cameras all share one IP - and every
+# camera on that address gets the same answer.
+function Invoke-RowTests {
+    param($Rows, [int]$Count, [int]$PingTimeout, [int]$PortTimeout)
+
+    $Rows = @($Rows)
+    if ($Rows.Count -eq 0) { return }
+
+    # When the recording server is what is down, ping the server, not the camera
+    foreach ($row in $Rows) {
+        if (($row.VmsStatus -match 'Server') -and $row.RsHost) { $row.PingTarget = $row.RsHost }
+        else                                                   { $row.PingTarget = $row.CameraIP }
+    }
+
+    $targets = @($Rows | Where-Object { $_.PingTarget } | ForEach-Object { $_.PingTarget } | Sort-Object -Unique)
+
+    $pingResults = @{}
+    if ($targets.Count -gt 0) {
+        Write-Host ("  {0} camera(s) to test on {1} address(es) - pinging ..." -f $Rows.Count, $targets.Count)
+        $pingResults = Invoke-PingBatch -Target $targets -Count $Count -TimeoutMs $PingTimeout
+    }
+
+    $portCache = @{}
+    foreach ($row in $Rows) {
+
+        if (-not $row.PingTarget) {
+            $row.Ping        = 'no address'
+            $row.Result      = 'NO ADDRESS'
+            $row.WhatToCheck = 'The VMS has no usable address for this device. Check the hardware entry in Management Client.'
+            continue
+        }
+
+        $p = $pingResults[$row.PingTarget]
+        if ($p -and $p.Success) {
+            $row.Ping      = 'reply'
+            $row.LatencyMs = $p.LatencyMs
+        } elseif ($p -and $p.Status -eq 'ResolveFailed') {
+            $row.Ping      = 'dns failed'
+            $row.LatencyMs = $null
+        } else {
+            $row.Ping      = 'no reply'
+            $row.LatencyMs = $null
+        }
+
+        $portOpen = $null
+        if ($row.Port -and $row.VmsStatus -notmatch 'Server') {
+            $cacheKey = '{0}|{1}' -f $row.PingTarget, $row.Port
+            if ($portCache.ContainsKey($cacheKey)) {
+                $portOpen = $portCache[$cacheKey]
+            } else {
+                $portOpen = Test-TcpPort -ComputerName $row.PingTarget -Port $row.Port -TimeoutMs $PortTimeout
+                $portCache[$cacheKey] = $portOpen
+                if ($portCache.Count % 10 -eq 0) { Write-Host ("  ... checked {0} device ports" -f $portCache.Count) }
+            }
+            if ($portOpen) { $row.PortCheck = 'open' } else { $row.PortCheck = 'closed' }
+        } else {
+            $row.PortCheck = 'not tested'
+        }
+
+        $pinged = ($row.Ping -eq 'reply')
+
+        if ($row.VmsStatus -match 'Server') {
+            if ($pinged) {
+                $row.Result      = 'SERVER ISSUE'
+                $row.WhatToCheck = "Recording server '$($row.RecordingServer)' answers ping but the VMS says it is not responding. Check the Milestone Recording Server service on that host - the camera is probably fine."
+            } else {
+                $row.Result      = 'SERVER OFFLINE'
+                $row.WhatToCheck = "Recording server '$($row.RecordingServer)' is not responding and does not answer ping. The server host is down - cameras on it cannot be judged until it is back."
+            }
+        }
+        elseif ($row.Ping -eq 'dns failed') {
+            $row.Result      = 'BAD ADDRESS'
+            $row.WhatToCheck = "The name '$($row.PingTarget)' does not resolve. Fix DNS, or put the IP address in the hardware entry."
+        }
+        elseif ($pinged -and $portOpen -eq $true) {
+            $row.Result      = 'CONNECTION ISSUE'
+            $row.WhatToCheck = 'Camera is on the network and its web port is open, but the VMS cannot talk to it. Check the device password, firmware, port, stream settings, or licence.'
+        }
+        elseif ($pinged -and $portOpen -eq $false) {
+            $row.Result      = 'SERVICE DOWN'
+            $row.WhatToCheck = "Camera answers ping but port $($row.Port) is closed. It may be rebooting or its web service has hung - power cycle it. Also confirm the port in the VMS is right."
+        }
+        elseif ($pinged) {
+            $row.Result      = 'CONNECTION ISSUE'
+            $row.WhatToCheck = 'Camera answers ping, so it is online. The fault is between the VMS and the camera - password, port, driver, or licence.'
+        }
+        elseif ($portOpen -eq $true) {
+            $row.Result      = 'ICMP BLOCKED'
+            $row.WhatToCheck = "No ping reply but port $($row.Port) is open, so ICMP is being filtered. Treat this as a connection issue, not a dead camera."
+        }
+        else {
+            $row.Result      = 'OFFLINE'
+            $row.WhatToCheck = 'No ping and no port response. Camera is off, the cable / PoE port is dead, or the IP has changed. Go check it physically.'
+        }
+    }
+}
+
+function Show-Results {
+    param($Rows, [string]$ServerName)
+
+    $all    = @($Rows)
+    $issues = @($all | Where-Object { $_.Result -ne 'OK' } | Sort-Object Result, RecordingServer, Camera)
+    $fixed  = @($all | Where-Object { $_.Fixed -eq 'yes' })
+    $left   = @($issues | Where-Object { $_.Result -ne 'DISABLED' })
+
+    Write-Host ''
+    Write-Host '  ------------------------------------------------------------'
+    Write-Host ("   RESULTS - {0} - {1}" -f $ServerName, (Get-Date -Format 'yyyy-MM-dd HH:mm'))
+    Write-Host '  ------------------------------------------------------------'
+    Write-Host ''
+    $okNow = @($all | Where-Object { $_.Result -eq 'OK' }).Count
+    Write-Host ("   Cameras {0}    Responding {1}    Still failing {2}" -f $all.Count, $okNow, $left.Count)
+
+    if ($fixed.Count -gt 0) {
+        Write-Host ''
+        Write-Host ("   Fixed during this visit: {0}" -f $fixed.Count) -ForegroundColor Green
+        foreach ($f in $fixed) {
+            Write-Host ("      {0,-38} was {1}" -f $f.Camera, $f.FirstResult) -ForegroundColor Green
+        }
+    }
+    Write-Host ''
+
+    if ($issues.Count -eq 0) {
+        Write-Host '   Every camera is responding. Nothing to chase.' -ForegroundColor Green
+        return
+    }
+
+    foreach ($g in ($issues | Group-Object Result | Sort-Object Name)) {
+        $color = 'Yellow'
+        if ($g.Name -match 'OFFLINE|BAD ADDRESS|NO ADDRESS') { $color = 'Red' }
+        Write-Host ("   {0}  ({1})" -f $g.Name, $g.Count) -ForegroundColor $color
+        foreach ($r in $g.Group) {
+            Write-Host ("      {0,-38} {1,-16} ping: {2}" -f $r.Camera, $r.CameraIP, $r.Ping)
+        }
+        Write-Host ''
+    }
+}
+
+# Writes the CSV. Returns the path actually used, or $null if it could not save
+# (most often because the file is still open in Excel).
+function Save-Report {
+    param($Rows, [string]$Path)
+
+    $export = @($Rows) |
+        Sort-Object @{ Expression = { if ($_.Result -eq 'OK') { 1 } else { 0 } } }, Result, RecordingServer, Camera |
+        Select-Object Camera, CameraIP, RecordingServer, Hardware, HardwareAddress,
+                      VmsStatus, Ping, LatencyMs, Port, PortCheck,
+                      FirstResult, Result, Fixed, WhatToCheck, LastChecked
+
+    try {
+        $export | Export-Csv -Path $Path -NoTypeInformation -Encoding UTF8
+        return $Path
+    } catch {
+        try {
+            $alt = Join-Path ([Environment]::GetFolderPath('Desktop')) (Split-Path -Leaf $Path)
+            $export | Export-Csv -Path $alt -NoTypeInformation -Encoding UTF8
+            Write-Host '   (Could not write next to this file - saved to your Desktop instead.)' -ForegroundColor Yellow
+            return $alt
+        } catch {
+            Write-Host ('   Could not save the CSV: {0}' -f $_.Exception.Message) -ForegroundColor Yellow
+            Write-Host '   If it is open in Excel, close it and re-check to save again.' -ForegroundColor Yellow
+            return $null
+        }
+    }
+}
+
 # --- Where this script lives (the CSV goes here) -----------------------------
 
 $scriptDir = $null
@@ -264,20 +484,6 @@ try {
         if ($k2 -and -not $rsMap.ContainsKey($k2)) { $rsMap[$k2] = $rs }
     }
 
-    Write-Host '  Checking live camera status ...'
-    $stateMap = @{}
-    try {
-        $getState  = Get-Command Get-ItemState
-        $stateArgs = @{}
-        if ($getState.Parameters.ContainsKey('CamerasOnly')) { $stateArgs['CamerasOnly'] = $true }
-        foreach ($s in @(Get-ItemState @stateArgs)) {
-            $k = Get-IdKey $s.FQID.ObjectId
-            if ($k) { $stateMap[$k] = [string]$s.State }
-        }
-    } catch {
-        Write-Host ("  Could not read live status: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
-    }
-
     # --- 4. Build the row set ------------------------------------------------
 
     $rows = New-Object System.Collections.ArrayList
@@ -305,10 +511,8 @@ try {
         }
         if (-not $rs) { try { $rs = $cam.GetRecordingServer() } catch { } }
 
-        $state  = 'Unknown'
         $camKey = Get-IdKey $cam.Id
         if (-not $camKey) { $camKey = Get-IdKey $cam.Path }
-        if ($camKey -and $stateMap.ContainsKey($camKey)) { $state = $stateMap[$camKey] }
 
         $address = $null
         if ($hw) { $address = [string]$hw.Address }
@@ -334,179 +538,91 @@ try {
             RecordingServer = $rsName
             Hardware        = $hwName
             HardwareAddress = $address
-            VmsStatus       = $state
+            VmsStatus       = 'Unknown'
             Ping            = 'not tested'
             LatencyMs       = $null
             Port            = $endpoint.Port
             PortCheck       = 'not tested'
+            FirstResult     = $null
+            PrevResult      = $null
             Result          = $null
+            Fixed           = ''
             WhatToCheck     = $null
+            LastChecked     = $null
+            CameraKey       = $camKey
             RsHost          = $rsHost
             PingTarget      = $null
             CameraEnabled   = $camEnabled
             HardwareEnabled = $hwEnabled
             Tested          = $false
-            CheckedAt       = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
         })
     }
 
-    foreach ($row in $rows) {
-        if ($row.VmsStatus -eq 'Responding') {
-            $row.Result      = 'OK'
-            $row.WhatToCheck = 'Camera is responding. Nothing to do.'
-        }
-        elseif (-not $row.CameraEnabled -or -not $row.HardwareEnabled) {
-            $row.Result      = 'DISABLED'
-            $row.WhatToCheck = 'Camera or hardware is disabled in the VMS. Not tested.'
-        }
-        else {
-            $row.Tested = $true
-        }
+    # --- 5. Check now, then re-check as you fix things ------------------------
+
+    if (-not $CsvPath) {
+        $safeName = ($serverName -replace '[\\/:*?"<>|]', '_')
+        $CsvPath  = Join-Path $scriptDir ("CameraCheck_{0}_{1}.csv" -f $safeName, (Get-Date -Format 'yyyy-MM-dd_HHmm'))
     }
 
-    $problems = @($rows | Where-Object { $_.Tested })
-    $okCount  = @($rows | Where-Object { $_.Result -eq 'OK' }).Count
+    $firstPass  = $true
+    $recheckAll = $true      # the first pass always covers every camera
 
-    Write-Host ''
-    Write-Host ("  Cameras found : {0}" -f $rows.Count)
-    Write-Host ("  Responding    : {0}" -f $okCount)
-    Write-Host ("  With an issue : {0}" -f $problems.Count)
-    Write-Host ''
+    while ($true) {
 
-    # --- 5. Ping the ones with a problem -------------------------------------
+        $stateMap = Get-VmsStateMap
 
-    if ($problems.Count -gt 0) {
-
-        # When the recording server is what is down, ping the server, not the camera
-        foreach ($row in $problems) {
-            if (($row.VmsStatus -match 'Server') -and $row.RsHost) { $row.PingTarget = $row.RsHost }
-            else                                                   { $row.PingTarget = $row.CameraIP }
+        if ($recheckAll) {
+            $scope = @($rows)
+        } else {
+            $scope = @($rows | Where-Object { $_.Result -ne 'OK' -and $_.Result -ne 'DISABLED' })
         }
 
-        $targets = @($problems | Where-Object { $_.PingTarget } | ForEach-Object { $_.PingTarget } | Sort-Object -Unique)
+        Set-RowStatus -Rows $scope -StateMap $stateMap
+        $toTest = @($scope | Where-Object { $_.Tested })
+        Invoke-RowTests -Rows $toTest -Count $PingCount -PingTimeout $PingTimeoutMs -PortTimeout $PortTimeoutMs
 
-        $pingResults = @{}
-        if ($targets.Count -gt 0) {
-            Write-Host ("  Pinging {0} address(es) ..." -f $targets.Count)
-            $pingResults = Invoke-PingBatch -Target $targets -Count $PingCount -TimeoutMs $PingTimeoutMs
+        # Anything that was broken and is now responding got fixed on this visit
+        foreach ($r in $scope) {
+            if ($r.PrevResult -and $r.PrevResult -ne 'OK' -and $r.Result -eq 'OK') { $r.Fixed = 'yes' }
+        }
+        if ($firstPass) {
+            foreach ($r in $rows) { $r.FirstResult = $r.Result }
+            $firstPass = $false
         }
 
-        $probed = 0
-        foreach ($row in $problems) {
+        Show-Results -Rows $rows -ServerName $serverName
 
-            if (-not $row.PingTarget) {
-                $row.Ping        = 'no address'
-                $row.Result      = 'NO ADDRESS'
-                $row.WhatToCheck = 'The VMS has no usable address for this device. Check the hardware entry in Management Client.'
-                continue
-            }
-
-            $p = $pingResults[$row.PingTarget]
-            if ($p -and $p.Success) {
-                $row.Ping      = 'reply'
-                $row.LatencyMs = $p.LatencyMs
-            } elseif ($p -and $p.Status -eq 'ResolveFailed') {
-                $row.Ping = 'dns failed'
-            } else {
-                $row.Ping = 'no reply'
-            }
-
-            $portOpen = $null
-            if ($row.Port -and $row.VmsStatus -notmatch 'Server') {
-                $probed++
-                if ($probed % 10 -eq 0) { Write-Host ("  ... checked {0} device ports" -f $probed) }
-                $portOpen = Test-TcpPort -ComputerName $row.PingTarget -Port $row.Port -TimeoutMs $PortTimeoutMs
-                if ($portOpen) { $row.PortCheck = 'open' } else { $row.PortCheck = 'closed' }
-            }
-
-            $pinged = ($row.Ping -eq 'reply')
-
-            if ($row.VmsStatus -match 'Server') {
-                if ($pinged) {
-                    $row.Result      = 'SERVER ISSUE'
-                    $row.WhatToCheck = "Recording server '$($row.RecordingServer)' answers ping but the VMS says it is not responding. Check the Milestone Recording Server service on that host - the camera is probably fine."
-                } else {
-                    $row.Result      = 'SERVER OFFLINE'
-                    $row.WhatToCheck = "Recording server '$($row.RecordingServer)' is not responding and does not answer ping. The server host is down - cameras on it cannot be judged until it is back."
-                }
-            }
-            elseif ($row.Ping -eq 'dns failed') {
-                $row.Result      = 'BAD ADDRESS'
-                $row.WhatToCheck = "The name '$($row.PingTarget)' does not resolve. Fix DNS, or put the IP address in the hardware entry."
-            }
-            elseif ($pinged -and $portOpen -eq $true) {
-                $row.Result      = 'CONNECTION ISSUE'
-                $row.WhatToCheck = 'Camera is on the network and its web port is open, but the VMS cannot talk to it. Check the device password, firmware, port, stream settings, or licence.'
-            }
-            elseif ($pinged -and $portOpen -eq $false) {
-                $row.Result      = 'SERVICE DOWN'
-                $row.WhatToCheck = "Camera answers ping but port $($row.Port) is closed. It may be rebooting or its web service has hung - power cycle it. Also confirm the port in the VMS is right."
-            }
-            elseif ($pinged) {
-                $row.Result      = 'CONNECTION ISSUE'
-                $row.WhatToCheck = 'Camera answers ping, so it is online. The fault is between the VMS and the camera - password, port, driver, or licence.'
-            }
-            elseif ($portOpen -eq $true) {
-                $row.Result      = 'ICMP BLOCKED'
-                $row.WhatToCheck = "No ping reply but port $($row.Port) is open, so ICMP is being filtered. Treat this as a connection issue, not a dead camera."
-            }
-            else {
-                $row.Result      = 'OFFLINE'
-                $row.WhatToCheck = 'No ping and no port response. Camera is off, the cable / PoE port is dead, or the IP has changed. Go check it physically.'
+        if (-not $NoCsv) {
+            $saved = Save-Report -Rows $rows -Path $CsvPath
+            if ($saved) {
+                $CsvPath = $saved
+                Write-Host ("   Report saved: {0}" -f $CsvPath) -ForegroundColor Green
             }
         }
+
+        if ($NoPause) { break }
+
+        $left = @($rows | Where-Object { $_.Result -ne 'OK' -and $_.Result -ne 'DISABLED' }).Count
+        if ($left -eq 0) { break }
+
+        Write-Host ''
+        Write-Host '   Go fix a camera, then re-check it here. Anything you have repaired'
+        Write-Host '   turns green and drops off the list, and the CSV is rewritten.'
+        Write-Host ''
+        Write-Host '     [R] Re-check only the cameras still failing   (just press Enter)'
+        Write-Host '     [A] Re-check every camera'
+        Write-Host '     [Q] Finish and open the report'
+        $choice = Read-Host '   Choice'
+        if ($choice -match '^\s*[Qq]') { break }
+        $recheckAll = ($choice -match '^\s*[Aa]')
+        Write-Host ''
     }
 
-    # --- 6. On-screen summary ------------------------------------------------
-
-    $issues = @($rows | Where-Object { $_.Result -ne 'OK' } | Sort-Object Result, RecordingServer, Camera)
-
-    Write-Host ''
-    Write-Host '  ------------------------------------------------------------'
-    Write-Host ("   RESULTS - {0} - {1}" -f $serverName, (Get-Date -Format 'yyyy-MM-dd HH:mm'))
-    Write-Host '  ------------------------------------------------------------'
-    Write-Host ''
-
-    if ($issues.Count -eq 0) {
-        Write-Host '   Every camera is responding. Nothing to chase.' -ForegroundColor Green
-    } else {
-        foreach ($g in ($issues | Group-Object Result | Sort-Object Name)) {
-            $color = 'Yellow'
-            if ($g.Name -match 'OFFLINE|BAD ADDRESS|NO ADDRESS') { $color = 'Red' }
-            Write-Host ("   {0}  ({1})" -f $g.Name, $g.Count) -ForegroundColor $color
-            foreach ($r in $g.Group) {
-                Write-Host ("      {0,-38} {1,-16} ping: {2}" -f $r.Camera, $r.CameraIP, $r.Ping)
-            }
-            Write-Host ''
+    if (-not $NoCsv -and -not $NoPause -and $CsvPath) {
+        if (Test-Path -LiteralPath $CsvPath) {
+            try { Start-Process -FilePath $CsvPath | Out-Null } catch { }
         }
-    }
-
-    # --- 7. CSV next to this script ------------------------------------------
-
-    if (-not $NoCsv) {
-        if (-not $CsvPath) {
-            $safeName = ($serverName -replace '[\\/:*?"<>|]', '_')
-            $fileName = "CameraCheck_{0}_{1}.csv" -f $safeName, (Get-Date -Format 'yyyy-MM-dd_HHmm')
-            $CsvPath  = Join-Path $scriptDir $fileName
-        }
-
-        $export = $rows |
-            Sort-Object @{ Expression = { if ($_.Result -eq 'OK') { 1 } else { 0 } } }, Result, RecordingServer, Camera |
-            Select-Object Camera, CameraIP, RecordingServer, Hardware, HardwareAddress,
-                          VmsStatus, Ping, LatencyMs, Port, PortCheck, Result, WhatToCheck, CheckedAt
-
-        try {
-            $export | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-        } catch {
-            # Folder is read-only (USB stick, network share) - fall back to the Desktop
-            $desktop = [Environment]::GetFolderPath('Desktop')
-            $CsvPath = Join-Path $desktop (Split-Path -Leaf $CsvPath)
-            $export | Export-Csv -Path $CsvPath -NoTypeInformation -Encoding UTF8
-            Write-Host '   (Script folder was not writable - saved to your Desktop instead.)' -ForegroundColor Yellow
-        }
-
-        Write-Host ("   Report saved: {0}" -f $CsvPath) -ForegroundColor Green
-        try { Start-Process -FilePath $CsvPath | Out-Null } catch { }
     }
 
     Stop-Here
