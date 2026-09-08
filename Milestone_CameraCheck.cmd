@@ -71,14 +71,15 @@ function Get-IdKey {
 function Get-DeviceEndpoint {
     param([string]$Address)
 
-    $result = [pscustomobject]@{ Host = $null; Port = $null }
+    $result = [pscustomobject]@{ Host = $null; Port = $null; Scheme = 'http' }
     if ([string]::IsNullOrWhiteSpace($Address)) { return $result }
 
     try {
         $uri = [uri]$Address
         if ($uri.IsAbsoluteUri -and $uri.Host) {
-            $result.Host = $uri.Host
-            $result.Port = $uri.Port
+            $result.Host   = $uri.Host
+            $result.Port   = $uri.Port
+            $result.Scheme = $uri.Scheme
             return $result
         }
     } catch { }
@@ -137,6 +138,113 @@ function Invoke-PingBatch {
         }
     }
     return $result
+}
+
+# Ask the device itself who it is. An unauthenticated GET of the device root -
+# the same request a browser makes - tells us a lot without sending any
+# credentials anywhere:
+#   HTTP 401 + WWW-Authenticate -> device is alive and wants a password, so the
+#                                  credential Milestone holds is the suspect
+#   HTTP 200                    -> web server answers with no auth at all
+#   Server: / realm=            -> often names the make and model, which is how
+#                                  you spot a camera that was swapped for a
+#                                  different one on the same IP
+function Get-HttpIdentity {
+    param([string]$ComputerName, [int]$Port, [switch]$UseTls, [int]$TimeoutMs = 3000)
+
+    $out = [pscustomobject]@{ Code = $null; Server = ''; Auth = ''; Realm = ''; Status = '' }
+    if (-not $ComputerName -or -not $Port) { return $out }
+
+    $scheme = 'http'
+    if ($UseTls) { $scheme = 'https' }
+    $url = '{0}://{1}:{2}/' -f $scheme, $ComputerName, $Port
+
+    $prevCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    try {
+        # Cameras almost always carry a self-signed certificate. Accept it for
+        # this probe only, then put the previous policy straight back.
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+        try {
+            [System.Net.ServicePointManager]::SecurityProtocol =
+                [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        } catch { }
+
+        $req = [System.Net.HttpWebRequest]([System.Net.WebRequest]::Create($url))
+        $req.Method            = 'GET'
+        $req.Timeout           = $TimeoutMs
+        $req.ReadWriteTimeout  = $TimeoutMs
+        $req.AllowAutoRedirect = $false
+        $req.UserAgent         = 'MilestoneCameraCheck'
+        $req.Credentials       = $null          # never send a password anywhere
+
+        $resp = $null
+        try {
+            $resp = $req.GetResponse()
+        } catch [System.Net.WebException] {
+            $resp = $_.Exception.Response       # a 401 lands here, and it is the useful case
+            if (-not $resp) {
+                $out.Status = [string]$_.Exception.Status
+                return $out
+            }
+        }
+
+        if ($resp) {
+            try { $out.Code   = [int]$resp.StatusCode } catch { }
+            try { $out.Server = [string]$resp.Headers['Server'] } catch { }
+            try {
+                $wa = [string]$resp.Headers['WWW-Authenticate']
+                if ($wa) {
+                    if ($wa -match '^\s*(\w+)')              { $out.Auth  = $matches[1] }
+                    if ($wa -match 'realm\s*=\s*"([^"]*)"')  { $out.Realm = $matches[1] }
+                }
+            } catch { }
+            try { $resp.Close() } catch { }
+        }
+    } catch {
+        $out.Status = 'error'
+    } finally {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prevCallback
+    }
+    return $out
+}
+
+# Which of the usual camera ports answer, plus the HTTP identity above.
+# Run once per address, never once per camera.
+function Get-DeviceFingerprint {
+    param([string]$ComputerName, [int]$Port, [string]$Scheme, [int]$PortTimeout = 2000)
+
+    $out = [pscustomobject]@{ Summary = ''; Ports = ''; Rtsp = $null }
+
+    $ports = @()
+    if ($Port) { $ports += [int]$Port }
+    foreach ($p in 80, 443, 554) { if ($ports -notcontains $p) { $ports += $p } }
+
+    $states = @()
+    foreach ($p in $ports) {
+        $isOpen = Test-TcpPort -ComputerName $ComputerName -Port $p -TimeoutMs $PortTimeout
+        if ($p -eq 554) { $out.Rtsp = $isOpen }
+        if ($isOpen) { $states += ("{0} open"   -f $p) }
+        else         { $states += ("{0} closed" -f $p) }
+    }
+    $out.Ports = ($states -join ', ')
+
+    $useTls = ($Scheme -eq 'https' -or $Port -eq 443)
+    $id = Get-HttpIdentity -ComputerName $ComputerName -Port $Port -UseTls:$useTls -TimeoutMs $PortTimeout
+
+    $bits = @()
+    if ($id.Code) {
+        $bits += ('HTTP {0}' -f $id.Code)
+    } elseif ($id.Status) {
+        $bits += ('no HTTP reply ({0})' -f $id.Status)
+    } else {
+        $bits += 'no HTTP reply'
+    }
+    if ($id.Auth)   { $bits += ('auth ' + $id.Auth) }
+    if ($id.Server) { $bits += ('Server: ' + $id.Server) }
+    if ($id.Realm)  { $bits += ('realm: ' + $id.Realm) }
+    $out.Summary = ($bits -join ', ')
+
+    return $out
 }
 
 function Test-TcpPort {
@@ -246,6 +354,7 @@ function Invoke-RowTests {
     }
 
     $portCache = @{}
+    $deepCache = @{}
     foreach ($row in $Rows) {
 
         if (-not $row.PingTarget) {
@@ -267,6 +376,8 @@ function Invoke-RowTests {
             $row.LatencyMs = $null
         }
 
+        $pinged = ($row.Ping -eq 'reply')
+
         $portOpen = $null
         if ($row.Port -and $row.VmsStatus -notmatch 'Server') {
             $cacheKey = '{0}|{1}' -f $row.PingTarget, $row.Port
@@ -282,7 +393,17 @@ function Invoke-RowTests {
             $row.PortCheck = 'not tested'
         }
 
-        $pinged = ($row.Ping -eq 'reply')
+        # Anything that answers the network gets interrogated, once per address
+        if ($pinged -and $row.VmsStatus -notmatch 'Server') {
+            if ($deepCache.ContainsKey($row.PingTarget)) {
+                $deep = $deepCache[$row.PingTarget]
+            } else {
+                $deep = Get-DeviceFingerprint -ComputerName $row.PingTarget -Port $row.Port -Scheme $row.Scheme -PortTimeout $PortTimeout
+                $deepCache[$row.PingTarget] = $deep
+            }
+            $row.DeviceReply = $deep.Summary
+            $row.OpenPorts   = $deep.Ports
+        }
 
         if (-not $row.StatusFound) {
             $row.Result = 'NO VMS STATUS'
@@ -306,8 +427,30 @@ function Invoke-RowTests {
             $row.WhatToCheck = "The name '$($row.PingTarget)' does not resolve. Fix DNS, or put the IP address in the hardware entry."
         }
         elseif ($pinged -and $portOpen -eq $true) {
-            $row.Result      = 'CONNECTION ISSUE'
-            $row.WhatToCheck = 'Camera is on the network and its web port is open, but the VMS cannot talk to it. Check the device password, firmware, port, stream settings, or licence.'
+            $row.Result = 'CONNECTION ISSUE'
+
+            if ($row.DeviceReply -match 'HTTP 401') {
+                $hint = 'The camera is alive and asking for a password (HTTP 401), so the network is fine and the device is fine. The password Milestone has stored for this hardware is the prime suspect - re-enter it on the hardware in Management Client.'
+            }
+            elseif ($row.DeviceReply -match 'HTTP 200') {
+                $hint = 'The camera web server answers with no password required (HTTP 200). Compare what it reports below with what Milestone expects - if they disagree, the device on this IP is not the one Milestone was set up for.'
+            }
+            elseif ($row.DeviceReply -match 'HTTP 30') {
+                $hint = 'The camera redirects the web request, which usually means it has moved to HTTPS. Check the protocol and port on the hardware in Management Client.'
+            }
+            elseif ($row.DeviceReply -match 'no HTTP reply') {
+                $hint = 'The port is open but nothing answers HTTP on it. Either the device moved to HTTPS, or something other than the camera now owns this IP address.'
+            }
+            else {
+                $hint = 'The camera is on the network and its port is open, but the VMS cannot talk to it. Check the device password, firmware, port, stream settings, or licence.'
+            }
+
+            if ($row.DeviceReply) { $hint = $hint + ' Device says: ' + $row.DeviceReply + '.' }
+            if ($row.VmsModel)    { $hint = $hint + ' Milestone expects: ' + $row.VmsModel + '.' }
+            if ($row.OpenPorts -match '554 closed') {
+                $hint = $hint + ' RTSP (554) is closed, so video cannot stream even though the web port answers.'
+            }
+            $row.WhatToCheck = $hint
         }
         elseif ($pinged -and $portOpen -eq $false) {
             $row.Result      = 'SERVICE DOWN'
@@ -365,6 +508,12 @@ function Show-Results {
         Write-Host ("   {0}  ({1})" -f $g.Name, $g.Count) -ForegroundColor $color
         foreach ($r in $g.Group) {
             Write-Host ("      {0,-38} {1,-16} ping: {2}" -f $r.Camera, $r.CameraIP, $r.Ping)
+            if ($r.DeviceReply) {
+                Write-Host ("          device: {0}" -f $r.DeviceReply) -ForegroundColor DarkGray
+                if ($r.VmsModel) {
+                    Write-Host ("          milestone expects: {0}" -f $r.VmsModel) -ForegroundColor DarkGray
+                }
+            }
         }
         Write-Host ''
     }
@@ -465,6 +614,11 @@ function Show-CameraDetail {
         $null = $out.Add(("     address tested  : {0}" -f $row.PingTarget))
         $null = $out.Add(("     ping            : {0}{1}" -f $row.Ping, $latency))
         $null = $out.Add(("     port {0,-11}: {1}" -f $row.Port, $row.PortCheck))
+        $null = $out.Add(("     ports seen      : {0}" -f $row.OpenPorts))
+        $null = $out.Add('')
+        $null = $out.Add('   WHAT THE DEVICE ITSELF SAID')
+        $null = $out.Add(("     reply           : {0}" -f $row.DeviceReply))
+        $null = $out.Add(("     milestone expects: {0}" -f $row.VmsModel))
         $null = $out.Add(("     last checked    : {0}" -f $row.LastChecked))
     }
 
@@ -496,7 +650,8 @@ function Save-Report {
     $export = @($Rows) |
         Sort-Object @{ Expression = { if ($_.Result -eq 'OK') { 1 } else { 0 } } }, Result, RecordingServer, Camera |
         Select-Object Camera, CameraIP, RecordingServer, Hardware, HardwareAddress,
-                      VmsStatus, Ping, LatencyMs, Port, PortCheck,
+                      VmsStatus, Ping, LatencyMs, Port, PortCheck, OpenPorts,
+                      VmsModel, DeviceReply,
                       FirstResult, Result, Fixed, WhatToCheck, LastChecked
 
     try {
@@ -657,7 +812,11 @@ try {
         if ($hw) { try { $hwEnabled = [bool]$hw.Enabled } catch { } }
 
         $hwName = '(unknown)'
-        if ($hw) { $hwName = [string]$hw.Name }
+        $hwModel = ''
+        if ($hw) {
+            $hwName = [string]$hw.Name
+            try { $hwModel = [string]$hw.Model } catch { }
+        }
         $rsName = '(unknown)'
         $rsHost = $null
         if ($rs) {
@@ -671,6 +830,10 @@ try {
             RecordingServer = $rsName
             Hardware        = $hwName
             HardwareAddress = $address
+            VmsModel        = $hwModel
+            Scheme          = $endpoint.Scheme
+            DeviceReply     = ''
+            OpenPorts       = ''
             VmsStatus       = 'Unknown'
             StatusFound     = $false
             Ping            = 'not tested'
